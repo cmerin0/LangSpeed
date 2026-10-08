@@ -1,0 +1,45 @@
+# CI: verifies every pull request with the Go test suite.
+#
+# Jobs:
+#   go test - go vet + go test ./... -race  (the status check to require in
+#                                            branch protection, e.g. "go test")
+name: CI
+
+on:
+  pull_request:
+
+# Least privilege: this workflow only reads the repository.
+permissions:
+  contents: read
+
+# One run per PR at a time; pushing again cancels the superseded run.
+concurrency:
+  group: ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  go-test:
+    name: go test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        # The Go module lives in server/ (docker-compose.yml sits at the root).
+        working-directory: server
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          # Keeps the CI toolchain in lockstep with go.mod (currently 1.27).
+          go-version-file: server/go.mod
+          # Module download cache keyed on go.sum.
+          cache-dependency-path: server/go.sum
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test ./... -race -count=1

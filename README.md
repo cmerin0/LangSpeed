@@ -7,10 +7,9 @@ tongue-twisters as fast and accurately as possible. Pick a difficulty, keep
 **Stack:** Go backend · PostgreSQL (permanent data) · Redis (live game state +
 leaderboard) · plain HTML/CSS/JS frontend — all orchestrated by Docker Compose.
 
-This repository currently contains **Step 1 (walking skeleton)** of the
-roadmap: the full infrastructure, database schema and admin seed from
-`LangSpeed_Requirements_English_Only.md` (Requirements 1, 2 and the request
-logging parts of 21).
+**Current progress:** Step 1 (walking skeleton) ✅ and Step 2
+(`game-session-creation`) ✅ — Requirements 1, 2, 3, 5, 20 and parts of 21 are
+implemented and verified. See the traceability tables below.
 
 ---
 
@@ -25,13 +24,14 @@ LangSpeed/
 └── server/                     # Go module
     ├── Dockerfile              # multi-stage build (context = repo root)
     ├── go.mod / go.sum
-    ├── cmd/server/main.go      # startup sequence (config → wait → migrate → seed → listen)
+    ├── cmd/server/main.go      # startup: config → wait → migrate → seed → listen
     └── internal/
         ├── config/             # env loading + validation (R1.3, R1.4)
-        ├── logging/            # structured JSON logger, levels DEBUG..ERROR (R21)
+        ├── logging/            # structured JSON logger (R21.10)
         ├── store/              # TCP health checks, migrations, Seed_Script
         │   └── migrations/     # 0001..0004 SQL, embedded into the binary
-        └── httpserver/         # router, static files, Request_Log middleware
+        ├── cache/              # Redis: Game_Session store + R20 serialization
+        └── httpserver/         # router, Request_Log middleware, game API
 ```
 
 ---
@@ -43,122 +43,133 @@ cp .env.example .env        # optional - everything has safe dev defaults
 docker compose up --build
 ```
 
-Then open:
-
-| URL | What |
-|---|---|
-| <http://localhost:3000> | placeholder frontend |
-| <http://localhost:3000/healthz> | backend health probe |
-
-First start pulls the images, waits for PostgreSQL + Redis to become healthy,
-applies the 4 migrations, creates the first admin user and only then starts
-accepting HTTP traffic.
+Then open <http://localhost:3000> (placeholder frontend) or
+<http://localhost:3000/healthz> (backend health probe).
 
 **Admin seed credentials (dev defaults):** `admin` / `admin12345` — set
 `ADMIN_USERNAME` / `ADMIN_PASSWORD` in `.env` before first start to change them.
-If an admin already exists, the seed is a no-op (R2.10).
 
-Inspect data:
+---
+
+## API
+
+| Method | Path | Body | Responses |
+|---|---|---|---|
+| `POST` | `/api/games` | `{"nickname":"carlo","difficulty":"easy"}` | `201` `{session_id, nickname, difficulty, hearts, score}` · `400` malformed JSON · `422` invalid/missing field(s) · `503` cache unavailable |
+| `GET` | `/api/games/{id}` | — | `200` session state · `404` not found or expired · `503` cache unavailable |
+| `GET` | `/healthz` | — | `200` `{"status":"ok"}` |
 
 ```bash
-docker compose exec database psql -U langspeed -d langspeed -c '\dt'
-docker compose exec database psql -U langspeed -d langspeed -c 'SELECT username, role FROM users;'
-docker compose exec cache redis-cli
-docker compose logs -f server        # structured JSON request logs
+# start a game
+curl -s -X POST localhost:3000/api/games \
+  -H 'Content-Type: application/json' \
+  -d '{"nickname":"carlo","difficulty":"hard"}'
+# -> {"session_id":"…","nickname":"carlo","difficulty":"hard","hearts":3,"score":0}
+
+# read it back (also refreshes the 2h inactivity window)
+curl -s localhost:3000/api/games/<session_id>
 ```
 
-Stop: `docker compose down` (add `-v` to also wipe the `pgdata` volume).
+Nickname: 1–32 characters (trimmed). Difficulty: exactly `easy`, `medium` or
+`hard`. Sessions live in Redis under `game_session:{id}` and expire 2 hours
+after the last read or write.
 
 ---
 
 ## Configuration (R1.3)
 
-All runtime configuration comes from environment variables. The server refuses
-to start when a required one is missing and logs **every** missing name in a
-single error line before exiting with status 1 (R1.4).
+The server refuses to start when a required variable is missing and logs
+**every** missing name in one error line before exiting with status 1 (R1.4).
 
 | Variable | Required | Used by | Default |
 |---|---|---|---|
 | `SERVER_PORT` | ✅ | server + compose host port | `3000` (compose, R1.5) |
 | `DATABASE_URL` | ✅ | server | built by compose from `POSTGRES_*` |
-| `REDIS_ADDR` | ✅ | server | `cache:6379` (compose) |
-| `JWT_SECRET` | ✅ | server (R13) | dev placeholder — **change it** |
+| `REDIS_ADDR` | ✅ | server (Game_Session store) | `cache:6379` (compose) |
+| `JWT_SECRET` | ✅ | server (R13, later) | dev placeholder — **change it** |
 | `ADMIN_USERNAME`, `ADMIN_PASSWORD` | seed only | Seed_Script (R2.8) | `admin` / `admin12345` |
 | `STATIC_DIR` | ➖ | server (frontend dir) | `./web`, then `../web` |
 | `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` | ➖ | database container | `langspeed` |
 
 > Avoid `@`, `:` and `#` in the dev database password — it is embedded in
-> `DATABASE_URL`.
-
-### Running the server outside Docker
-
-The database/cache ports are intentionally **not published** to the host. For
-local `go run` development either add `ports:` entries to `database`/`cache` in
-`docker-compose.yml`, or run your own local instances, then:
-
-```bash
-cd server
-$env:SERVER_PORT="3000"             # PowerShell — see .env.example for all four
-$env:DATABASE_URL="postgres://langspeed:langspeed@localhost:5432/langspeed?sslmode=disable"
-$env:REDIS_ADDR="localhost:6379"
-$env:JWT_SECRET="dev"
-go run ./cmd/server
-```
+> `DATABASE_URL`. To run the server outside Docker, add `ports:` entries for
+> `database`/`cache` in `docker-compose.yml` and point `DATABASE_URL` /
+> `REDIS_ADDR` at `localhost` (see `.env.example`).
 
 ---
 
-## What step 1 implements (traceability)
+## Traceability
+
+### Step 1 — infrastructure, schema, seed
 
 | Requirement | Where | Status |
 |---|---|---|
 | R1.1 exactly 3 services | `docker-compose.yml` | ✅ |
-| R1.2 wait for healthy DB/Cache: TCP, ≤5 attempts, ≤30 s | `store.WaitReady` + compose `depends_on: service_healthy` | ✅ verified (5 WARN lines, aborts < 30 s, exit 1) |
+| R1.2 wait for healthy DB/Cache: TCP, ≤5 attempts, ≤30 s | `store.WaitReady` + `depends_on: service_healthy` | ✅ verified |
 | R1.3 config from env vars | `config.Load` | ✅ |
 | R1.4 missing var → non-zero exit naming each var | `config.Load` + `main` | ✅ verified |
-| R1.5 host port from env, default 3000 | compose `ports: "${SERVER_PORT:-3000}:…"` | ✅ |
+| R1.5 host port from env, default 3000 | compose `ports` | ✅ |
 | R1.6 named volume for the database | `volumes: pgdata` | ✅ |
-| R2.1 migrations applied in order before serving | `store.Migrate` (embedded, ordered, own tx each) | ✅ |
-| R2.2 failed migration → halt, name it, no later migrations | `store.Migrate` | ✅ |
-| R2.3–R2.6 the four tables | `server/internal/store/migrations/*.sql` | ✅ |
-| R2.7 `role` accepts only `admin`/`moderator` | CHECK constraint in `0002` | ✅ |
-| R2.8 seed creates exactly one admin | `store.SeedAdmin` (bcrypt cost 12, R13.7) | ✅ |
-| R2.9 missing credentials → abort naming them, no insert | `store.SeedAdmin` | ✅ |
-| R2.10 admin exists → skip + INFO log | `store.SeedAdmin` | ✅ |
+| R2.1/R2.2 ordered migrations, halt + name on failure | `store.Migrate` | ✅ |
+| R2.3–R2.6 the four tables | `store/migrations/*.sql` | ✅ |
+| R2.7 `role` only `admin`/`moderator` | CHECK in `0002` | ✅ |
+| R2.8–R2.10 Seed_Script (bcrypt 12, skip if exists, abort on missing vars) | `store.SeedAdmin` | ✅ verified |
 | R21.1 Request_Log: method, path, status, latency | `httpserver.withRequestLog` | ✅ |
-| R21.2/R21.3 log severity by status | `severityFor` | ✅ (see note 2 below) |
-| R21.10 structured JSON lines | `logging.Logger` | ✅ |
+| R21.2/R21.3 severity by status | `severityFor` | ✅ (503→WARN, see note 2) |
 | R21.4 no SQL/stack traces in logs | `dbFailure` + client-safe `writeError` | ✅ |
 
-**Tests:** `cd server && go test ./...` (env validation) ·
-`go vet ./...`
+### Step 2 — `game-session-creation`
+
+| Requirement | Where | Status |
+|---|---|---|
+| R3.1 start-game endpoint (nickname 1–32, difficulty enum) | `POST /api/games` | ✅ |
+| R3.2 empty nickname → 422 "nickname is required" | `validateStartRequest` | ✅ verified |
+| R3.3 >32 chars → 422 naming the limit | `validateStartRequest` | ✅ verified |
+| R3.4 bad difficulty → 422 listing all three values | `validateStartRequest` | ✅ verified |
+| R3.5 creates Game_Session in Cache, returns Session_ID | `cache.Store.Create` | ✅ verified (201) |
+| R3.6 cache unavailable → 503 | `cache.ErrUnavailable` | ✅ verified (answered in 2.5 s) |
+| R5.1 all 7 fields initialized (3 hearts, 0 score, empty list, timestamp) | `cache.NewGameSession` | ✅ unit + Redis inspection |
+| R5.2 exactly 2 h TTL, reset on every read **and** write | `SET NX EX` + `GETEX` + `Save` | ✅ verified (TTL 92 → 7200) |
+| R5.3 unknown Session_ID → error response | `GET /api/games/{id}` → 404 | ✅ verified |
+| R5.4 exactly one session per Session_ID | one Redis key per UUID | ✅ |
+| R5.5 Session_ID returned in the response body | 201 body | ✅ |
+| R5.6 invalid/missing fields → 422, **no partial session** | validation before any Redis call | ✅ tests assert 0 keys |
+| R5.7 concurrent creates → only one session stored | `SET NX` + ID regeneration | ✅ unit test |
+| R20.1 deterministic serialization (identical bytes) | struct-only JSON | ✅ byte-equality test |
+| R20.2/R20.3 lossless round-trip of every field | `Serialize`/`Deserialize` | ✅ field-by-field test |
+| R20.4/R20.5 no partial write, no partial object | nil bytes / nil object on error | ✅ tests |
+| R21.5 session-created INFO log without the nickname | `handleStartGame` | ✅ leak check CLEAN |
+
+**Tests:** `cd server && go test ./...` (23 tests across `config`, `cache`,
+`httpserver`) · `go vet ./...`
 
 ---
 
 ## Decisions & open questions
 
-1. **Seed runs inside server boot** (after migrations, before listen). The
-   glossary calls it a "script that runs on first startup"; making it a startup
-   step keeps `docker compose up` a true single command. A dedicated compose
-   job would also work if you prefer separation.
+1. **Seed runs inside server boot** (after migrations, before listen) to keep
+   `docker compose up` a single command.
 2. **503 log level conflict:** R21.2 says *5xx → ERROR* but R21.3 explicitly
-   lists `503` among *WARN* codes. We follow the explicit mention → `503` logs
-   as WARN, other 5xx as ERROR. Flag this to whoever wrote the spec.
-3. **R12.6 + R12.8 (future):** "keep only the highest score per nickname" and
-   "equal scores → earlier entry ranks higher" don't match Redis sorted-set
-   defaults (lexicographic tie-break). Needs an encoding scheme — design it
-   before implementing the leaderboard.
-4. **R7.3 (future):** mentions a "remaining Attempts count" but no maximum
-   attempts is defined anywhere — only the 3-heart limit. Clarify.
-5. **DATABASE_URL errors are never echoed** (they contain the password);
-   database failures log the server message + SQLSTATE only, never SQL text.
+   lists `503` among *WARN* codes → we log 503 as WARN, other 5xx as ERROR.
+3. **Session API statuses not in the spec:** success is `201 Created`
+   (REST convention), a syntactically malformed JSON body is `400`; every
+   spec-defined validation failure uses `422` as written.
+4. **Whitespace-only nicknames** are treated as empty (422) and valid
+   nicknames are stored trimmed — the glossary requires a *non-empty* nickname.
+5. **R12.6 + R12.8 (future):** "highest score per nickname" vs "earlier entry
+   wins ties" doesn't match Redis sorted-set defaults — design before building
+   the leaderboard.
+6. **R7.3 (future):** mentions a "remaining Attempts count" that no requirement
+   defines (only the 3-heart limit) — clarify.
 
 ---
 
 ## Roadmap
 
-- [x] **Step 1** — infra, schema, seed, request logging (R1, R2, R21.1/10)
-- [ ] **Step 2** — game session + tongue-twister selection (R3–R6, R20)
-- [ ] **Step 3** — typing attempts, scoring, hearts (R7–R9)
-- [ ] **Step 4** — game end win/loss + leaderboard (R10–R12)
-- [ ] **Step 5** — admin JWT auth + CRUD endpoints (R13–R17)
-- [ ] **Step 6** — game UI + admin panel frontend (R18, R19), rest of R21
+- [x] **Step 1** — infra, schema, seed, request logging (R1, R2, R21.1–21.4/21.10)
+- [x] **Step 2** — game-session-creation (R3, R5, R20, R21.5) — *feature/game-session-creation*
+- [ ] **Step 3** — tongue-twister selection + next-twister endpoint (R4, R6)
+- [ ] **Step 4** — typing attempts, scoring, hearts (R7–R9)
+- [ ] **Step 5** — game end win/loss + leaderboard (R10–R12)
+- [ ] **Step 6** — admin JWT auth + CRUD endpoints (R13–R17)
+- [ ] **Step 7** — game UI + admin panel frontend (R18, R19)
