@@ -1,0 +1,65 @@
+# LangSpeed - the complete stack runs with one command: docker compose up --build
+# Requirement 1.1: exactly three services (Server, Database, Cache).
+name: langspeed
+
+services:
+  # --- Database (PostgreSQL, Requirement 2) ---
+  database:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-langspeed}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-langspeed}
+      POSTGRES_DB: ${POSTGRES_DB:-langspeed}
+    volumes:
+      # Requirement 1.6: named volume so data survives container restarts.
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # Health = successful connection check (pg_isready opens a TCP connection).
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    # Not published to the host on purpose. Inspect it with:
+    #   docker compose exec database psql -U langspeed -d langspeed
+
+  # --- Cache (Redis, Requirements 5, 6, 12) ---
+  cache:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    # Not published to the host on purpose. Inspect it with:
+    #   docker compose exec cache redis-cli
+
+  # --- Server (Go HTTP backend) ---
+  server:
+    build:
+      context: .              # repo root so the Dockerfile sees both server/ and web/
+      dockerfile: server/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      # Requirement 1.2: the Server starts only after Database and Cache are healthy.
+      database:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+    environment:
+      # Requirement 1.3: all runtime configuration comes from environment variables.
+      SERVER_PORT: "${SERVER_PORT:-3000}"                                       # R1.5: host port defaults to 3000
+      DATABASE_URL: "postgres://${POSTGRES_USER:-langspeed}:${POSTGRES_PASSWORD:-langspeed}@database:5432/${POSTGRES_DB:-langspeed}?sslmode=disable"
+      REDIS_ADDR: "cache:6379"
+      JWT_SECRET: "${JWT_SECRET:-dev-only-change-me-before-production}"
+      ADMIN_USERNAME: "${ADMIN_USERNAME:-admin}"                                 # Seed_Script credentials (R2.8)
+      ADMIN_PASSWORD: "${ADMIN_PASSWORD:-admin12345}"
+    ports:
+      # Requirement 1.5: reachable from the host browser on a configurable port.
+      - "${SERVER_PORT:-3000}:${SERVER_PORT:-3000}"
+
+volumes:
+  pgdata:

@@ -1,0 +1,15 @@
+# Local environment - never commit real secrets
+.env
+
+# Build artifacts
+server/langspeed-server
+server/server
+*.exe
+bin/
+dist/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

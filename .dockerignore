@@ -1,0 +1,9 @@
+# Keep the image build context minimal and free of secrets.
+.git/
+.env
+*.env
+bin/
+dist/
+*.exe
+.vscode/
+.idea/
