@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"langspeed/internal/cache"
 	"langspeed/internal/config"
 	"langspeed/internal/logging"
 )
@@ -20,14 +21,15 @@ import (
 // Server owns the HTTP surface of the LangSpeed backend. Endpoints for later
 // requirements are registered from routes().
 type Server struct {
-	cfg config.Config
-	log *logging.Logger
-	mux *http.ServeMux
+	cfg      config.Config
+	log      *logging.Logger
+	sessions *cache.Store
+	mux      *http.ServeMux
 }
 
 // New builds the server and registers every route known at this stage.
-func New(cfg config.Config, log *logging.Logger) *Server {
-	s := &Server{cfg: cfg, log: log, mux: http.NewServeMux()}
+func New(cfg config.Config, log *logging.Logger, sessions *cache.Store) *Server {
+	s := &Server{cfg: cfg, log: log, sessions: sessions, mux: http.NewServeMux()}
 	s.routes()
 	s.registerStatic()
 	return s
@@ -36,11 +38,13 @@ func New(cfg config.Config, log *logging.Logger) *Server {
 // Handler wraps the router with the Request_Log middleware (R21.1).
 func (s *Server) Handler() http.Handler { return s.withRequestLog(s.mux) }
 
-// routes is the single registration point for API endpoints. Step 1 of the
-// project only needs the health probe; Requirements 3-17 add their endpoints
-// here as the project progresses.
+// routes is the single registration point for API endpoints.
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
+
+	// Game session creation (R3, R5).
+	s.mux.HandleFunc("POST /api/games", s.handleStartGame)
+	s.mux.HandleFunc("GET /api/games/{id}", s.handleGetSession)
 }
 
 // handleHealthz answers liveness probes with a structured JSON body.

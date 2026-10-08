@@ -22,6 +22,7 @@ import (
 	"syscall"
 	"time"
 
+	"langspeed/internal/cache"
 	"langspeed/internal/config"
 	"langspeed/internal/httpserver"
 	"langspeed/internal/logging"
@@ -87,7 +88,12 @@ func main() {
 	}
 
 	// --- 5. HTTP server ----------------------------------------------------
-	api := httpserver.New(cfg, log)
+	// Game_Sessions live in the Cache (glossary); reachability was already
+	// confirmed by the TCP wait above (R1.2).
+	sessions := cache.New(cfg.RedisAddr)
+	defer func() { _ = sessions.Close() }()
+
+	api := httpserver.New(cfg, log, sessions)
 	httpSrv := &http.Server{
 		Addr:              ":" + cfg.ServerPort,
 		Handler:           api.Handler(),
