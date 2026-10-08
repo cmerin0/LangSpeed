@@ -74,8 +74,8 @@ func TestNewGameSessionInitializesFields(t *testing.T) {
 	if _, err := uuid.Parse(session.SessionID); err != nil {
 		t.Errorf("Session_ID is not a valid UUID: %v", err)
 	}
-	if session.Nickname != "carlo" {
-		t.Errorf("Nickname = %q, want carlo", session.Nickname)
+	if session.Nickname != "carlos" {
+		t.Errorf("Nickname = %q, want carlos", session.Nickname)
 	}
 	if session.Difficulty != "easy" {
 		t.Errorf("Difficulty = %q, want easy", session.Difficulty)
