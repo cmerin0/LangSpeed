@@ -2,7 +2,9 @@ package httpserver
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,6 +17,7 @@ import (
 	"langspeed/internal/cache"
 	"langspeed/internal/config"
 	"langspeed/internal/logging"
+	"langspeed/internal/store"
 )
 
 // testServer bundles a Server, its captured log output and the miniredis it
@@ -25,7 +28,9 @@ type testServer struct {
 	mr     *miniredis.Miniredis
 }
 
-// newTestServer builds a Server backed by an in-process Redis.
+// newTestServer builds a Server backed by an in-process Redis. The default
+// fake selector echoes the requested difficulty; /next tests override
+// ts.server.content when they need a different outcome.
 func newTestServer(t *testing.T) *testServer {
 	t.Helper()
 	mr := miniredis.RunT(t)
@@ -34,6 +39,7 @@ func newTestServer(t *testing.T) *testServer {
 		config.Config{ServerPort: "0", StaticDir: t.TempDir()},
 		logging.New(logs),
 		cache.New(mr.Addr()),
+		&fakeContent{},
 	)
 	return &testServer{server: server, logs: logs, mr: mr}
 }
@@ -52,8 +58,43 @@ func newDeadCacheServer(t *testing.T) *testServer {
 		config.Config{ServerPort: "0", StaticDir: t.TempDir()},
 		logging.New(logs),
 		dead,
+		&fakeContent{},
 	)
 	return &testServer{server: server, logs: logs}
+}
+
+// fakeContent substitutes for the PostgreSQL-backed selector so the HTTP
+// surface can be tested without a database. It records what the handler asked
+// for, which lets tests assert the difficulty and already-shown list passed
+// down to selection (R4.5, R6.1).
+type fakeContent struct {
+	twister *store.Twister   // returned when err is nil; nil echoes the difficulty
+	err     error            // error to return instead of a twister
+	onCall  func()           // hook run before answering (e.g. kill the Cache)
+
+	difficulty string // difficulty of the last call
+	shown      []int64 // already-shown list of the last call
+	calls      int
+}
+
+func (f *fakeContent) NextTwister(_ context.Context, difficulty string, shown []int64) (*store.Twister, error) {
+	f.calls++
+	f.difficulty = difficulty
+	f.shown = append([]int64(nil), shown...)
+	if f.onCall != nil {
+		f.onCall()
+	}
+	if f.err != nil {
+		return nil, f.err
+	}
+	if f.twister != nil {
+		return f.twister, nil
+	}
+	return &store.Twister{
+		ID:         42,
+		Text:       "She sells seashells by the seashore.",
+		Difficulty: difficulty,
+	}, nil
 }
 
 // request performs a request against the full handler stack (including the
@@ -256,5 +297,186 @@ func TestSessionCreatedLogOmitsNickname(t *testing.T) {
 	}
 	if strings.Contains(logs, nickname) {
 		t.Errorf("nickname leaked into the logs:\n%s", logs)
+	}
+}
+
+// createSession starts a game and returns its Session_ID. The nickname is a
+// deliberate canary: it must never appear in a log line (R21.5) and is
+// chosen so no substring of it can occur in file paths by accident.
+func createSession(t *testing.T, ts *testServer, difficulty string) string {
+	t.Helper()
+	rec := ts.request("POST", "/api/games", `{"nickname":"canary-player","difficulty":"`+difficulty+`"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201 (%s)", rec.Code, rec.Body.String())
+	}
+	var state gameStateResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &state); err != nil {
+		t.Fatalf("create response is not JSON: %v", err)
+	}
+	return state.SessionID
+}
+
+// TestNextTwisterReturnsAndMarksShown covers the happy path of R6: the
+// session's difficulty is passed to selection (R4.5), the twister comes back
+// with the R9.5-mandated Heart count, the ID is recorded before it is
+// returned (R6.4) so the following call sees it as shown (R6.1), and no
+// nickname reaches any log line (R21.5).
+func TestNextTwisterReturnsAndMarksShown(t *testing.T) {
+	ts := newTestServer(t)
+	fake := ts.server.content.(*fakeContent)
+	id := createSession(t, ts, "medium")
+
+	rec := ts.request("GET", "/api/games/"+id+"/next", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("next status = %d, want 200 (%s)", rec.Code, rec.Body.String())
+	}
+	var got nextTwisterResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("next response is not JSON: %v", err)
+	}
+	if got.TongueTwisterID == 0 {
+		t.Error("response does not contain a tongue_twister_id")
+	}
+	if got.Difficulty != "medium" {
+		t.Errorf("Difficulty = %q, want the session's difficulty medium", got.Difficulty)
+	}
+	if got.Hearts != 3 {
+		t.Errorf("Hearts = %d, want the current count 3 (R9.5)", got.Hearts)
+	}
+	if got.Score != 0 {
+		t.Errorf("Score = %d, want 0", got.Score)
+	}
+	if fake.difficulty != "medium" {
+		t.Errorf("selection difficulty = %q, want session difficulty medium (R4.5)", fake.difficulty)
+	}
+	if len(fake.shown) != 0 {
+		t.Errorf("first selection shown list = %v, want empty (R5.1)", fake.shown)
+	}
+
+	// The second request must already carry the first ID (R6.4 -> R6.1).
+	ts.request("GET", "/api/games/"+id+"/next", "")
+	if len(fake.shown) != 1 || fake.shown[0] != got.TongueTwisterID {
+		t.Errorf("second selection shown = %v, want [%d]", fake.shown, got.TongueTwisterID)
+	}
+
+	if strings.Contains(ts.logs.String(), "canary-player") {
+		t.Errorf("nickname leaked into the logs:\n%s", ts.logs.String())
+	}
+}
+
+// TestNextTwisterCompletedNotifiesPlayer covers R6.3's notification: pool
+// exhaustion is a 200 with a message, not an error.
+func TestNextTwisterCompletedNotifiesPlayer(t *testing.T) {
+	ts := newTestServer(t)
+	ts.server.content = &fakeContent{err: store.ErrAllShown}
+	id := createSession(t, ts, "easy")
+
+	rec := ts.request("GET", "/api/games/"+id+"/next", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("next status = %d, want 200 (%s)", rec.Code, rec.Body.String())
+	}
+	var payload struct {
+		Completed bool   `json:"completed"`
+		Message   string `json:"message"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("response is not JSON: %v", err)
+	}
+	if !payload.Completed {
+		t.Errorf("completed = false, want true: %s", rec.Body.String())
+	}
+	if !strings.Contains(payload.Message, "all tongue-twisters") || !strings.Contains(payload.Message, "completed") {
+		t.Errorf("message = %q, want the R6.3 completion notification", payload.Message)
+	}
+}
+
+// TestNextTwisterNoContent covers R4.6: an empty catalogue for the difficulty
+// is a 404 saying so.
+func TestNextTwisterNoContent(t *testing.T) {
+	ts := newTestServer(t)
+	ts.server.content = &fakeContent{err: store.ErrNoContent}
+	id := createSession(t, ts, "hard")
+
+	rec := ts.request("GET", "/api/games/"+id+"/next", "")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("next status = %d, want 404 (%s)", rec.Code, rec.Body.String())
+	}
+	if msg := errorBody(t, rec); !strings.Contains(msg, "no content is available for the selected difficulty") {
+		t.Errorf("error = %q, want the R4.6 no-content message", msg)
+	}
+}
+
+// TestNextTwisterUnknownSession: an unknown or expired Session_ID cannot have
+// an already-shown list, so selection is never consulted (R5.3).
+func TestNextTwisterUnknownSession(t *testing.T) {
+	ts := newTestServer(t)
+	fake := ts.server.content.(*fakeContent)
+
+	rec := ts.request("GET", "/api/games/00000000-0000-0000-0000-000000000000/next", "")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("next status = %d, want 404 (%s)", rec.Code, rec.Body.String())
+	}
+	if msg := errorBody(t, rec); !strings.Contains(msg, "not found or has expired") {
+		t.Errorf("error = %q, want not-found message", msg)
+	}
+	if fake.calls != 0 {
+		t.Errorf("selector was called %d times for an unknown session, want 0", fake.calls)
+	}
+}
+
+// TestNextTwisterCacheUnavailableOnRead covers R6.5: when the already-shown
+// list cannot be read, the response says the session state could not be
+// retrieved - and state is untouched because nothing was written.
+func TestNextTwisterCacheUnavailableOnRead(t *testing.T) {
+	ts := newDeadCacheServer(t)
+
+	rec := ts.request("GET", "/api/games/anything/next", "")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("next status = %d, want 503 (%s)", rec.Code, rec.Body.String())
+	}
+	if msg := errorBody(t, rec); !strings.Contains(msg, "session state could not be retrieved") {
+		t.Errorf("error = %q, want the R6.5 read-failure message", msg)
+	}
+}
+
+// TestNextTwisterCacheUnavailableOnWrite covers R6.6: if the shown-list
+// update fails after selection, the answer is 503 "session state could not
+// be updated" and carries no tongue-twister at all. The Cache dies between
+// the handler's read and its write to force exactly that path.
+func TestNextTwisterCacheUnavailableOnWrite(t *testing.T) {
+	ts := newTestServer(t)
+	fake := ts.server.content.(*fakeContent)
+	fake.onCall = func() { ts.mr.Close() } // Cache unreachable from here on
+	id := createSession(t, ts, "easy")
+
+	rec := ts.request("GET", "/api/games/"+id+"/next", "")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("next status = %d, want 503 (%s)", rec.Code, rec.Body.String())
+	}
+	if msg := errorBody(t, rec); !strings.Contains(msg, "session state could not be updated") {
+		t.Errorf("error = %q, want the R6.6 write-failure message", msg)
+	}
+	if strings.Contains(rec.Body.String(), "seashells") {
+		t.Errorf("R6.6 response leaked the tongue-twister: %s", rec.Body.String())
+	}
+}
+
+// TestNextTwisterSelectionFailure: an unexpected database failure is a
+// sanitized 500, never an internal message.
+func TestNextTwisterSelectionFailure(t *testing.T) {
+	ts := newTestServer(t)
+	ts.server.content = &fakeContent{err: errors.New(`pq: relation "tongue_twisters" does not exist`)}
+	id := createSession(t, ts, "easy")
+
+	rec := ts.request("GET", "/api/games/"+id+"/next", "")
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("next status = %d, want 500 (%s)", rec.Code, rec.Body.String())
+	}
+	msg := errorBody(t, rec)
+	if !strings.Contains(msg, "could not be selected") {
+		t.Errorf("error = %q, want the selection-failure message", msg)
+	}
+	if strings.Contains(msg, "pq:") || strings.Contains(msg, "relation") {
+		t.Errorf("error leaked database internals (R21.4): %q", msg)
 	}
 }

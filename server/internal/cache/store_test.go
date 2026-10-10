@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 	"time"
 
@@ -199,5 +200,65 @@ func TestCreateOnlyOneSessionPerID(t *testing.T) {
 	}
 	if other.Nickname != "second-player" {
 		t.Errorf("Nickname = %q, want second-player", other.Nickname)
+	}
+}
+
+// TestAddShownTwisterPersistsList covers R6.4: the ID is recorded in the
+// stored Game_Session, duplicates are ignored, the update resets the 2h
+// window (R5.2) and a fresh read sees the full list (R6.1's basis).
+func TestAddShownTwisterPersistsList(t *testing.T) {
+	store, mr := newTestStore(t)
+	ctx := context.Background()
+
+	session := NewGameSession("carlo", "easy", time.Now().UTC())
+	if err := store.Create(ctx, session); err != nil {
+		t.Fatalf("Create() failed: %v", err)
+	}
+
+	updated, err := store.AddShownTwister(ctx, session.SessionID, 7)
+	if err != nil {
+		t.Fatalf("AddShownTwister(7) failed: %v", err)
+	}
+	if len(updated.ShownIDs) != 1 || updated.ShownIDs[0] != 7 {
+		t.Errorf("ShownIDs = %v, want [7]", updated.ShownIDs)
+	}
+	if ttl := mr.TTL("game_session:" + session.SessionID); ttl != 2*time.Hour {
+		t.Errorf("TTL after mark-shown = %s, want exactly 2h (R5.2)", ttl)
+	}
+
+	// The same ID twice stays a single entry.
+	if _, err := store.AddShownTwister(ctx, session.SessionID, 7); err != nil {
+		t.Fatalf("second AddShownTwister(7) failed: %v", err)
+	}
+	if _, err := store.AddShownTwister(ctx, session.SessionID, 9); err != nil {
+		t.Fatalf("AddShownTwister(9) failed: %v", err)
+	}
+
+	stored, err := store.Get(ctx, session.SessionID)
+	if err != nil {
+		t.Fatalf("Get() failed: %v", err)
+	}
+	if want := []int64{7, 9}; !slices.Equal(stored.ShownIDs, want) {
+		t.Errorf("persisted ShownIDs = %v, want %v", stored.ShownIDs, want)
+	}
+}
+
+// TestAddShownTwisterUnknownSession covers R5.3 on the write path.
+func TestAddShownTwisterUnknownSession(t *testing.T) {
+	store, _ := newTestStore(t)
+
+	_, err := store.AddShownTwister(context.Background(), "00000000-0000-0000-0000-000000000000", 1)
+	if !errors.Is(err, ErrSessionNotFound) {
+		t.Errorf("AddShownTwister() unknown id = %v, want ErrSessionNotFound", err)
+	}
+}
+
+// TestAddShownTwisterCacheUnavailable covers R3.6 on the write path: an
+// unreachable Cache surfaces as ErrUnavailable so the API can answer with the
+// R6.6 message.
+func TestAddShownTwisterCacheUnavailable(t *testing.T) {
+	_, err := deadStore().AddShownTwister(context.Background(), "anything", 1)
+	if !errors.Is(err, ErrUnavailable) {
+		t.Errorf("AddShownTwister() against dead cache = %v, want ErrUnavailable", err)
 	}
 }

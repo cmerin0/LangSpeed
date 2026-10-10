@@ -3,6 +3,7 @@
 package httpserver
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -16,6 +17,7 @@ import (
 	"langspeed/internal/cache"
 	"langspeed/internal/config"
 	"langspeed/internal/logging"
+	"langspeed/internal/store"
 )
 
 // Server owns the HTTP surface of the LangSpeed backend. Endpoints for later
@@ -24,12 +26,20 @@ type Server struct {
 	cfg      config.Config
 	log      *logging.Logger
 	sessions *cache.Store
+	content  twisterSelector
 	mux      *http.ServeMux
 }
 
+// twisterSelector hands out the next tongue-twister for a session (R4, R6).
+// *store.Content implements it against PostgreSQL; tests substitute fakes so
+// the HTTP surface stays testable without a database.
+type twisterSelector interface {
+	NextTwister(ctx context.Context, difficulty string, shown []int64) (*store.Twister, error)
+}
+
 // New builds the server and registers every route known at this stage.
-func New(cfg config.Config, log *logging.Logger, sessions *cache.Store) *Server {
-	s := &Server{cfg: cfg, log: log, sessions: sessions, mux: http.NewServeMux()}
+func New(cfg config.Config, log *logging.Logger, sessions *cache.Store, content twisterSelector) *Server {
+	s := &Server{cfg: cfg, log: log, sessions: sessions, content: content, mux: http.NewServeMux()}
 	s.routes()
 	s.registerStatic()
 	return s
@@ -45,6 +55,10 @@ func (s *Server) routes() {
 	// Game session creation (R3, R5).
 	s.mux.HandleFunc("POST /api/games", s.handleStartGame)
 	s.mux.HandleFunc("GET /api/games/{id}", s.handleGetSession)
+
+	// Tongue-twister selection (R4, R6). The more specific pattern wins over
+	// the session read above.
+	s.mux.HandleFunc("GET /api/games/{id}/next", s.handleNextTwister)
 }
 
 // handleHealthz answers liveness probes with a structured JSON body.

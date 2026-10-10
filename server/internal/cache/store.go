@@ -114,3 +114,30 @@ func (s *Store) Save(ctx context.Context, session *GameSession) error {
 	}
 	return nil
 }
+
+// AddShownTwister appends twisterID to the session's already-shown list and
+// persists the update - the R6.4 bookkeeping that guarantees a tongue-twister
+// is recorded before it is ever returned to the player (R6.1 relies on this
+// list to exclude repeats).
+//
+// The session is re-read first so the append starts from the freshest state;
+// an ID already present is not appended twice. Read failures surface
+// ErrSessionNotFound / ErrUnavailable unchanged; a failed write leaves the
+// stored entry as it was, because Save serializes before touching Redis
+// (R20.4). Callers map those errors to R6.5 / R6.6 responses.
+func (s *Store) AddShownTwister(ctx context.Context, sessionID string, twisterID int64) (*GameSession, error) {
+	session, err := s.Get(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	for _, shown := range session.ShownIDs {
+		if shown == twisterID {
+			return session, nil
+		}
+	}
+	session.ShownIDs = append(session.ShownIDs, twisterID)
+	if err := s.Save(ctx, session); err != nil {
+		return nil, err
+	}
+	return session, nil
+}
