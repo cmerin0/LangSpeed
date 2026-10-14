@@ -19,6 +19,9 @@ var (
 	// ErrAllShown: content exists, but this Game_Session has already been
 	// shown every eligible tongue-twister (R6.3).
 	ErrAllShown = errors.New("all tongue-twisters for the current difficulty have been completed")
+	// ErrTwisterNotFound: the requested tongue-twister ID is not in the
+	// catalogue (deleted by an admin after it was served).
+	ErrTwisterNotFound = errors.New("tongue-twister not found")
 )
 
 // Twister is one selectable tongue-twister: exactly the columns R4 and R6
@@ -88,6 +91,31 @@ func (c *Content) selectNext(ctx context.Context, difficulty string, shown []int
 	var twister Twister
 	if err := row.Scan(&twister.ID, &twister.Text, &twister.Difficulty); err != nil {
 		return nil, err
+	}
+	return &twister, nil
+}
+
+// TwisterByID returns one catalogue row by its primary key. Attempts need it:
+// grading an attempt compares the player's text against the tongue-twister the
+// session is currently typing (R7), and that text lives only in PostgreSQL.
+//
+// A missing row yields ErrTwisterNotFound; database failures are wrapped with
+// dbFailure so callers can log them without leaking SQL (R21.4). The lookup
+// deliberately ignores the active flag - a twister deactivated after being
+// served must still be gradable, or the session could never clear it.
+func (c *Content) TwisterByID(ctx context.Context, id int64) (*Twister, error) {
+	const query = `
+		SELECT id, text, difficulty
+		FROM tongue_twisters
+		WHERE id = $1`
+
+	row := c.db.QueryRowContext(ctx, query, id)
+	var twister Twister
+	if err := row.Scan(&twister.ID, &twister.Text, &twister.Difficulty); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrTwisterNotFound
+		}
+		return nil, fmt.Errorf("tongue-twister %d could not be loaded: %s", id, dbFailure(err))
 	}
 	return &twister, nil
 }

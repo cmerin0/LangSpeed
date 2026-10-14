@@ -21,7 +21,9 @@ const InitialHearts = 3
 //
 // R5.1 mandates every field below: Session_ID, Nickname, Difficulty, current
 // Heart count (3), current Score (0), the list of Tongue_Twister IDs already
-// shown (empty) and a creation timestamp.
+// shown (empty) and a creation timestamp. CurrentTwisterID (R7) is additional
+// attempt state: the tongue-twister currently awaiting an attempt, 0 when
+// none is pending. The seven R5.1 fields keep their required initial values.
 //
 // The struct deliberately contains no maps: json.Marshal emits struct fields
 // in declaration order, so serializing the same state twice always produces
@@ -35,6 +37,12 @@ type GameSession struct {
 	Score      int       `json:"score"`
 	ShownIDs   []int64   `json:"shown_ids"`
 	CreatedAt  time.Time `json:"created_at"`
+	// CurrentTwisterID is the tongue-twister the player is currently typing:
+	// set when /next serves one, cleared when its attempt is graded (R7). It
+	// exists so one served twister can only ever be graded once - resubmitting
+	// cannot double-score or double-charge hearts. Zero means "no attempt is
+	// pending", which the API reports as a 409 rather than guessing.
+	CurrentTwisterID int64 `json:"current_twister_id"`
 }
 
 // NewGameSession builds an initialized Game_Session with a server-generated

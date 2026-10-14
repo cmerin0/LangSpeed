@@ -15,16 +15,18 @@ func fixedTime() time.Time {
 }
 
 // sampleSession returns a fully populated session, including a non-empty
-// already-shown list to exercise nested collections.
+// already-shown list to exercise nested collections and a pending twister to
+// exercise the attempt state (R7).
 func sampleSession() *GameSession {
 	return &GameSession{
-		SessionID:  "550e8400-e29b-41d4-a716-446655440000",
-		Nickname:   "carlos",
-		Difficulty: "hard",
-		Hearts:     2,
-		Score:      1234,
-		ShownIDs:   []int64{7, 3, 42},
-		CreatedAt:  fixedTime(),
+		SessionID:        "550e8400-e29b-41d4-a716-446655440000",
+		Nickname:         "carlos",
+		Difficulty:       "hard",
+		Hearts:           2,
+		Score:            1234,
+		ShownIDs:         []int64{7, 3, 42},
+		CreatedAt:        fixedTime(),
+		CurrentTwisterID: 42,
 	}
 }
 
@@ -61,6 +63,9 @@ func assertSessionsEqual(t *testing.T, want, got *GameSession) {
 	if !got.CreatedAt.Equal(want.CreatedAt) {
 		t.Errorf("CreatedAt = %v, want %v", got.CreatedAt, want.CreatedAt)
 	}
+	if got.CurrentTwisterID != want.CurrentTwisterID {
+		t.Errorf("CurrentTwisterID = %d, want %d", got.CurrentTwisterID, want.CurrentTwisterID)
+	}
 }
 
 // TestNewGameSessionInitializesFields covers R5.1: every mandated field is
@@ -91,6 +96,9 @@ func TestNewGameSessionInitializesFields(t *testing.T) {
 	}
 	if session.ShownIDs == nil || len(session.ShownIDs) != 0 {
 		t.Errorf("ShownIDs = %v, want an empty non-nil list", session.ShownIDs)
+	}
+	if session.CurrentTwisterID != 0 {
+		t.Errorf("CurrentTwisterID = %d, want 0 - no twister is pending before /next serves one (R7)", session.CurrentTwisterID)
 	}
 	if !session.CreatedAt.Equal(fixedTime()) {
 		t.Errorf("CreatedAt = %v, want %v", session.CreatedAt, fixedTime())

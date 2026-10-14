@@ -263,3 +263,36 @@ func TestNextTwisterNoActiveContent(t *testing.T) {
 		t.Errorf("fully shown catalogue = %v, want ErrAllShown (R6.3)", err)
 	}
 }
+
+// TestTwisterByID covers the attempt-grading lookup (R7): the row comes back
+// verbatim, an inactive row is still loadable (it was served while active and
+// must remain gradable), and a missing ID is ErrTwisterNotFound - never a
+// partial object.
+func TestTwisterByID(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	wipeTwisters(t, db)
+	content := NewContent(db)
+
+	id := insertTwister(t, db, "Toy boat, toy boat, toy boat.", "medium", true)
+	got, err := content.TwisterByID(ctx, id)
+	if err != nil {
+		t.Fatalf("TwisterByID(%d) failed: %v", id, err)
+	}
+	if got.ID != id || got.Text != "Toy boat, toy boat, toy boat." || got.Difficulty != "medium" {
+		t.Errorf("TwisterByID(%d) = %+v, want the full row", id, got)
+	}
+
+	// Deactivated after being served: grading must still find it.
+	if _, err := db.ExecContext(ctx, `UPDATE tongue_twisters SET active = false WHERE id = $1`, id); err != nil {
+		t.Fatalf("row could not be deactivated: %v", err)
+	}
+	if _, err := content.TwisterByID(ctx, id); err != nil {
+		t.Errorf("TwisterByID() of a deactivated row = %v, want no error", err)
+	}
+
+	// Missing ID: a sentinel error, no fabricated twister.
+	if _, err := content.TwisterByID(ctx, 999999); !errors.Is(err, ErrTwisterNotFound) {
+		t.Errorf("TwisterByID(missing) = %v, want ErrTwisterNotFound", err)
+	}
+}
