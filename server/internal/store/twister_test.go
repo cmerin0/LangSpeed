@@ -126,7 +126,7 @@ func TestSeedMigrationFillsEmptyCatalogue(t *testing.T) {
 		t.Fatalf("seed migration failed on an empty catalogue: %v", err)
 	}
 
-	wantPerDifficulty := map[string]int64{"easy": 12, "medium": 10, "hard": 8}
+	wantPerDifficulty := map[string]int64{"easy": 17, "medium": 15, "hard": 13}
 	var total int64
 	for difficulty, want := range wantPerDifficulty {
 		got := activeCountFor(t, db, difficulty)
