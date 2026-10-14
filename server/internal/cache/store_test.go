@@ -262,3 +262,151 @@ func TestAddShownTwisterCacheUnavailable(t *testing.T) {
 		t.Errorf("AddShownTwister() against dead cache = %v, want ErrUnavailable", err)
 	}
 }
+
+// TestAddShownTwisterMarksPending covers the R7 half of the /next
+// bookkeeping: the served twister becomes the pending attempt, alongside the
+// already-shown list (R6.4).
+func TestAddShownTwisterMarksPending(t *testing.T) {
+	store, _ := newTestStore(t)
+	ctx := context.Background()
+
+	session := NewGameSession("carlo", "easy", time.Now().UTC())
+	if err := store.Create(ctx, session); err != nil {
+		t.Fatalf("Create() failed: %v", err)
+	}
+
+	updated, err := store.AddShownTwister(ctx, session.SessionID, 7)
+	if err != nil {
+		t.Fatalf("AddShownTwister(7) failed: %v", err)
+	}
+	if updated.CurrentTwisterID != 7 {
+		t.Errorf("CurrentTwisterID = %d, want 7 - the served twister awaits the attempt (R7)", updated.CurrentTwisterID)
+	}
+
+	// Re-serving the same ID keeps exactly one shown entry (R6.1) but is
+	// still the pending attempt.
+	if _, err := store.AddShownTwister(ctx, session.SessionID, 7); err != nil {
+		t.Fatalf("second AddShownTwister(7) failed: %v", err)
+	}
+	stored, err := store.Get(ctx, session.SessionID)
+	if err != nil {
+		t.Fatalf("Get() failed: %v", err)
+	}
+	if want := []int64{7}; !slices.Equal(stored.ShownIDs, want) {
+		t.Errorf("persisted ShownIDs = %v, want %v", stored.ShownIDs, want)
+	}
+	if stored.CurrentTwisterID != 7 {
+		t.Errorf("CurrentTwisterID = %d, want 7", stored.CurrentTwisterID)
+	}
+}
+
+// TestRecordAttemptCorrectAddsPoints: a correct attempt raises the Score by
+// the granted points, leaves Hearts alone, consumes the pending twister and
+// resets the 2h window (R5.2).
+func TestRecordAttemptCorrectAddsPoints(t *testing.T) {
+	store, mr := newTestStore(t)
+	ctx := context.Background()
+
+	session := NewGameSession("carlo", "hard", time.Now().UTC())
+	if err := store.Create(ctx, session); err != nil {
+		t.Fatalf("Create() failed: %v", err)
+	}
+	if _, err := store.AddShownTwister(ctx, session.SessionID, 42); err != nil {
+		t.Fatalf("AddShownTwister() failed: %v", err)
+	}
+
+	updated, err := store.RecordAttempt(ctx, session.SessionID, true, 30)
+	if err != nil {
+		t.Fatalf("RecordAttempt(correct) failed: %v", err)
+	}
+	if updated.Score != 30 {
+		t.Errorf("Score = %d, want 30", updated.Score)
+	}
+	if updated.Hearts != InitialHearts {
+		t.Errorf("Hearts = %d, want %d (a correct attempt costs no Heart)", updated.Hearts, InitialHearts)
+	}
+	if updated.CurrentTwisterID != 0 {
+		t.Errorf("CurrentTwisterID = %d, want 0 (consumed - one attempt per twister)", updated.CurrentTwisterID)
+	}
+	if ttl := mr.TTL("game_session:" + session.SessionID); ttl != 2*time.Hour {
+		t.Errorf("TTL after attempt = %s, want exactly 2h (R5.2)", ttl)
+	}
+
+	// Persisted, not just returned.
+	stored, err := store.Get(ctx, session.SessionID)
+	if err != nil {
+		t.Fatalf("Get() failed: %v", err)
+	}
+	if stored.Score != 30 || stored.CurrentTwisterID != 0 {
+		t.Errorf("persisted session = %+v, want Score 30 and no pending twister", stored)
+	}
+}
+
+// TestRecordAttemptWrongCostsHeart: a wrong attempt spends one Heart, adds no
+// points and consumes the pending twister. The Heart count bottoms out at
+// zero - R7.3 defines the remaining attempts as exactly 3, 2 or 1.
+func TestRecordAttemptWrongCostsHeart(t *testing.T) {
+	store, _ := newTestStore(t)
+	ctx := context.Background()
+
+	session := NewGameSession("carlo", "easy", time.Now().UTC())
+	if err := store.Create(ctx, session); err != nil {
+		t.Fatalf("Create() failed: %v", err)
+	}
+
+	for wantHearts := InitialHearts - 1; wantHearts >= 0; wantHearts-- {
+		if _, err := store.AddShownTwister(ctx, session.SessionID, int64(wantHearts+1)); err != nil {
+			t.Fatalf("AddShownTwister() failed: %v", err)
+		}
+		updated, err := store.RecordAttempt(ctx, session.SessionID, false, 10)
+		if err != nil {
+			t.Fatalf("RecordAttempt(wrong) failed: %v", err)
+		}
+		if updated.Hearts != wantHearts {
+			t.Errorf("Hearts = %d, want %d", updated.Hearts, wantHearts)
+		}
+		if updated.Score != 0 {
+			t.Errorf("Score = %d, want 0 (a wrong attempt awards nothing)", updated.Score)
+		}
+	}
+}
+
+// TestRecordAttemptWithoutPendingTwister: grading nothing is refused with
+// ErrNoPendingAttempt and leaves the stored entry untouched - no Hearts, no
+// Score, nothing.
+func TestRecordAttemptWithoutPendingTwister(t *testing.T) {
+	store, _ := newTestStore(t)
+	ctx := context.Background()
+
+	session := NewGameSession("carlo", "easy", time.Now().UTC())
+	if err := store.Create(ctx, session); err != nil {
+		t.Fatalf("Create() failed: %v", err)
+	}
+
+	if _, err := store.RecordAttempt(ctx, session.SessionID, false, 0); !errors.Is(err, ErrNoPendingAttempt) {
+		t.Errorf("RecordAttempt() without a pending twister = %v, want ErrNoPendingAttempt", err)
+	}
+
+	stored, err := store.Get(ctx, session.SessionID)
+	if err != nil {
+		t.Fatalf("Get() failed: %v", err)
+	}
+	if stored.Hearts != InitialHearts || stored.Score != 0 {
+		t.Errorf("session changed although no attempt was graded: %+v", stored)
+	}
+}
+
+// TestRecordAttemptUnknownSession / TestRecordAttemptCacheUnavailable: the
+// R5.3 / R3.6 error contract on the new write path.
+func TestRecordAttemptErrors(t *testing.T) {
+	_, err := deadStore().RecordAttempt(context.Background(), "anything", true, 10)
+	if !errors.Is(err, ErrUnavailable) {
+		t.Errorf("RecordAttempt() against dead cache = %v, want ErrUnavailable", err)
+	}
+
+	store, _ := newTestStore(t)
+	_, err = store.RecordAttempt(context.Background(), "00000000-0000-0000-0000-000000000000", true, 10)
+	if !errors.Is(err, ErrSessionNotFound) {
+		t.Errorf("RecordAttempt() unknown id = %v, want ErrSessionNotFound", err)
+	}
+}

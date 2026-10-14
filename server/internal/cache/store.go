@@ -27,6 +27,11 @@ var (
 	ErrSessionNotFound = errors.New("session not found or has expired")
 	// ErrUnavailable: the Cache cannot be reached (R3.6).
 	ErrUnavailable = errors.New("cache is temporarily unavailable")
+	// ErrNoPendingAttempt: RecordAttempt was called while no tongue-twister
+	// awaits an attempt (CurrentTwisterID is 0) - either none was served yet,
+	// or the pending one was already graded. Grading nothing would corrupt
+	// Hearts or Score, so the attempt is refused (R7).
+	ErrNoPendingAttempt = errors.New("no tongue-twister is awaiting an attempt")
 )
 
 // Store persists Game_Sessions in Redis under the key game_session:{id}.
@@ -115,10 +120,11 @@ func (s *Store) Save(ctx context.Context, session *GameSession) error {
 	return nil
 }
 
-// AddShownTwister appends twisterID to the session's already-shown list and
-// persists the update - the R6.4 bookkeeping that guarantees a tongue-twister
-// is recorded before it is ever returned to the player (R6.1 relies on this
-// list to exclude repeats).
+// AddShownTwister appends twisterID to the session's already-shown list,
+// marks it as the tongue-twister currently awaiting an attempt
+// (CurrentTwisterID, R7) and persists the update - the R6.4 bookkeeping that
+// guarantees a tongue-twister is recorded before it is ever returned to the
+// player (R6.1 relies on this list to exclude repeats).
 //
 // The session is re-read first so the append starts from the freshest state;
 // an ID already present is not appended twice. Read failures surface
@@ -130,12 +136,54 @@ func (s *Store) AddShownTwister(ctx context.Context, sessionID string, twisterID
 	if err != nil {
 		return nil, err
 	}
+	// Re-serving an already-shown ID must not duplicate it in the list
+	// (R6.1's basis), but it still becomes the pending attempt.
+	alreadyShown := false
 	for _, shown := range session.ShownIDs {
 		if shown == twisterID {
-			return session, nil
+			alreadyShown = true
+			break
 		}
 	}
-	session.ShownIDs = append(session.ShownIDs, twisterID)
+	if !alreadyShown {
+		session.ShownIDs = append(session.ShownIDs, twisterID)
+	}
+	session.CurrentTwisterID = twisterID
+	if err := s.Save(ctx, session); err != nil {
+		return nil, err
+	}
+	return session, nil
+}
+
+// RecordAttempt grades the tongue-twister the session is currently typing
+// (R7-R9) and persists the resulting state in one write:
+//
+//   - a correct attempt adds points to the Score;
+//   - a wrong attempt costs one Heart (never below zero - R7.3 defines the
+//     remaining attempts as exactly the 3, 2 or 1 Hearts left);
+//   - either way the pending tongue-twister is consumed (CurrentTwisterID
+//     cleared), so one served twister can be graded exactly once and a
+//     resubmission can never double-score or double-charge.
+//
+// Grading without a pending twister returns ErrNoPendingAttempt and leaves
+// the stored entry untouched. Read and write failures surface like
+// AddShownTwister's, so the HTTP layer can answer R6.5 / R6.6-style 503s.
+func (s *Store) RecordAttempt(ctx context.Context, sessionID string, correct bool, points int) (*GameSession, error) {
+	session, err := s.Get(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	if session.CurrentTwisterID == 0 {
+		return nil, ErrNoPendingAttempt
+	}
+
+	if correct {
+		session.Score += points
+	} else if session.Hearts > 0 {
+		session.Hearts--
+	}
+	session.CurrentTwisterID = 0
+
 	if err := s.Save(ctx, session); err != nil {
 		return nil, err
 	}

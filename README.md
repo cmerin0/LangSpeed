@@ -8,9 +8,10 @@ tongue-twisters as fast and accurately as possible. Pick a difficulty, keep
 leaderboard) · plain HTML/CSS/JS frontend — all orchestrated by Docker Compose.
 
 **Current progress:** Step 1 (walking skeleton) ✅, Step 2
-(`game-session-creation`) ✅ and Step 3 (`tongue-twister-selection`) ✅ —
-Requirements 1, 2, 3, 5, 6, 20 and parts of 4 and 21 are implemented and
-verified. See the traceability tables below.
+(`game-session-creation`) ✅, Step 3 (`tongue-twister-selection`) ✅ and
+Step 4 (`attempts-scoring-hearts`) ✅ — Requirements 1, 2, 3, 5, 6, 7, 8, 9,
+20 and parts of 4 and 21 are implemented and verified. See the traceability
+tables below.
 
 ---
 
@@ -31,9 +32,10 @@ LangSpeed/
         ├── config/             # env loading + validation (R1.3, R1.4)
         ├── logging/            # structured JSON logger (R21.10)
         ├── store/              # TCP health checks, migrations, Seed_Script,
-        │   │                     tongue-twister selection (R4, R6)
+        │   │                     tongue-twister selection + lookup (R4, R6, R7)
         │   └── migrations/     # 0001..0005 SQL, embedded into the binary
-        ├── cache/              # Redis: Game_Session store + R20 serialization
+        ├── cache/              # Redis: Game_Session store, R20 serialization,
+        │                         attempt state transitions (R7-R9)
         └── httpserver/         # router, Request_Log middleware, game API
 ```
 
@@ -60,7 +62,8 @@ Then open <http://localhost:3000> (placeholder frontend) or
 |---|---|---|---|
 | `POST` | `/api/games` | `{"nickname":"carlo","difficulty":"easy"}` | `201` `{session_id, nickname, difficulty, hearts, score}` · `400` malformed JSON · `422` invalid/missing field(s) · `503` cache unavailable |
 | `GET` | `/api/games/{id}` | — | `200` session state · `404` not found or expired · `503` cache unavailable |
-| `GET` | `/api/games/{id}/next` | — | `200` `{tongue_twister_id, text, difficulty, hearts, score}` · `200 {"completed":true,"message":…}` pool exhausted (R6.3) · `404` unknown session or no content for the difficulty · `503` session state could not be retrieved/updated |
+| `GET` | `/api/games/{id}/next` | — | `200` `{tongue_twister_id, text, difficulty, hearts, score}` — repeats the pending twister until it is attempted · `200 {"completed":true,"message":…}` pool exhausted (R6.3) · `404` unknown session or no content for the difficulty · `409` game already over (0 hearts) · `503` session state could not be retrieved/updated |
+| `POST` | `/api/games/{id}/attempts` | `{"text":"she sells seashells…"}` | `200` `{session_id, tongue_twister_id, correct, hearts, score, game_over}` · `400` malformed JSON · `422` missing/empty text · `404` unknown session · `409` game over / no pending twister / twister deleted · `503` cache unavailable |
 | `GET` | `/healthz` | — | `200` `{"status":"ok"}` |
 
 ```bash
@@ -73,15 +76,29 @@ curl -s -X POST localhost:3000/api/games \
 # read it back (also refreshes the 2h inactivity window)
 curl -s localhost:3000/api/games/<session_id>
 
-# fetch the next tongue-twister (recorded as shown before it is returned)
+# fetch the next tongue-twister (recorded as shown before it is returned;
+# repeated calls keep returning the same one until it is attempted)
 curl -s localhost:3000/api/games/<session_id>/next
 # -> {"tongue_twister_id":12,"text":"…","difficulty":"hard","hearts":3,"score":0}
 # -> {"completed":true,"message":"all tongue-twisters for the current difficulty have been completed"}
+
+# submit the typed text for the pending tongue-twister
+curl -s -X POST localhost:3000/api/games/<session_id>/attempts \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"she sells seashells by the seashore"}'
+# -> {"session_id":"…","tongue_twister_id":12,"correct":true,"hearts":3,"score":30,"game_over":false}
 ```
 
 Nickname: 1–32 characters (trimmed). Difficulty: exactly `easy`, `medium` or
 `hard`. Sessions live in Redis under `game_session:{id}` and expire 2 hours
 after the last read or write.
+
+**Grading** (R7–R9): the typed text is compared to the pending twister
+ignoring letter case and surrounding/doubled whitespace — every other
+character must match. A correct attempt scores `easy` 10 / `medium` 20 /
+`hard` 30; a wrong one costs one of your 3 hearts **and** consumes the
+twister. At 0 hearts the game is over: further attempts and `/next` answer
+`409` until Step 5 adds the game-end handling.
 
 ---
 
@@ -217,6 +234,33 @@ Docker is unavailable. **E2E (compose):** full 12-twister pool drained with no
 repeats, completion notification, R4.6 and R6.5 responses, `shown_ids` in
 Redis, no nickname in logs, 3/3 services healthy.
 
+### Step 4 — `attempts-scoring-hearts`
+
+| Requirement | Where | Status |
+|---|---|---|
+| R7 one attempt per served twister (submit the pending text) | `POST /api/games/{id}/attempts` | ✅ |
+| R7.1 attempt graded against the twister the session is typing | `GameSession.CurrentTwisterID` + `Content.TwisterByID` | ✅ verified (E2E) |
+| R7.2 one attempt per twister: a resubmission is a 409, never a re-grade | `RecordAttempt` clears the pending ID | ✅ verified |
+| R7.3 remaining attempts = remaining Hearts (3, 2 or 1; 0 = lost) | `RecordAttempt` (hearts bottom out at 0) | ✅ verified (see decision 10) |
+| R7.4 wrong attempt costs one Heart and consumes the twister | `RecordAttempt(correct=false)` | ✅ verified |
+| R8.1 correct attempt adds points: easy 10 / medium 20 / hard 30 | `scoreFor` | ✅ verified (E2E) |
+| R8.2 wrong attempt awards nothing | `RecordAttempt` | ✅ verified |
+| R8.3 case/whitespace-insensitive grading, characters exact | `normalizeForComparison` | ✅ table test |
+| R9.1 game starts with 3 Hearts | `cache.InitialHearts` (unchanged from Step 2) | ✅ |
+| R9.5 every attempt response carries the Heart count | `attemptResponse.Hearts` | ✅ verified |
+| R9.6 at 0 Hearts the game is over: attempts and `/next` → 409 | `handleAttempt` / `handleNextTwister` guards | ✅ verified (E2E) |
+| R7.5 no partial state: rejected requests never mutate the session | validation before any Cache write | ✅ tests assert the pending twister survives |
+| R7.6 cache read/write failure → 503, state preserved | `cache.ErrUnavailable` | ✅ verified |
+| R21.5 graded-attempt log without nickname or typed text | `handleAttempt` | ✅ leak check CLEAN |
+
+**Tests:** 56 tests across `config`, `cache`, `httpserver`, `store` ·
+`go vet ./...` · `go test ./... -race -count=1` green on Linux.
+**E2E (compose):** full loop verified — correct attempt (+10/+30), wrong
+attempt (−1 heart), duplicate submit → 409, `/next` idempotent while a
+twister is pending, third wrong attempt → `game_over:true`, attempts and
+`/next` → 409 afterwards, `current_twister_id` cleared and TTL refreshed in
+Redis, no nickname or typed text in any log line.
+
 ---
 
 ## Decisions & open questions
@@ -230,11 +274,12 @@ Redis, no nickname in logs, 3/3 services healthy.
    spec-defined validation failure uses `422` as written.
 4. **Whitespace-only nicknames** are treated as empty (422) and valid
    nicknames are stored trimmed — the glossary requires a *non-empty* nickname.
-5. **R12.6 + R12.8 (future):** "highest score per nickname" vs "earlier entry
-   wins ties" doesn't match Redis sorted-set defaults — design before building
-   the leaderboard.
-6. **R7.3 (future):** mentions a "remaining Attempts count" that no requirement
-   defines (only the 3-heart limit) — clarify.
+5. **R12.6 + R12.8 (resolved by owner):** the leaderboard has **no
+   tie-break** — ordering is by score alone. Combined with the outcome model
+   (decision 10), ties simply coexist; nothing extra is computed.
+6. **R7.3 (resolved by owner):** the "remaining Attempts count" **is** the
+   remaining Heart count — a player has 3, 2 or 1 attempts left, and 0 Hearts
+   means the game is lost. There is no separate attempts counter.
 7. **R6.3 split across Steps 3 and 5:** pool exhaustion returns the completion
    notification immediately (well within 3 s), but *ending* the Game_Session
    writes a Game_Record and updates the leaderboard (R10–R11). The teardown
@@ -247,6 +292,29 @@ Redis, no nickname in logs, 3/3 services healthy.
 9. **`/next` responses carry `hearts` (and `score`)** because the request
    modifies Game_Session state (the shown list) — R9.5 requires the current
    Heart count in every such response.
+10. **Win/loss model (owner):** you lose when your 3 hearts are gone, you win
+    when you complete every tongue-twister of your difficulty. Step 4
+    implements the loss side (0 hearts → `game_over`, then 409s); the win
+    side's persistence (Game_Record, leaderboard) is Step 5's R10–R12, and
+    the R6.3 completion notification already reports "pool exhausted".
+11. **Grading is case- and whitespace-insensitive, character-exact
+    otherwise:** `strings.EqualFold` on whitespace-collapsed text. A typo in
+    any character fails the attempt; " SHE  SELLS…" never does.
+12. **Fixed points per difficulty (10/20/30), no speed bonus yet:** the
+    requirements text for R8 isn't in the repo; difficulty weighting is the
+    only signal the Game_Session carries today. A speed or accuracy bonus can
+    be layered on without breaking anything — the response already reports
+    `score`.
+13. **A wrong attempt consumes the twister** (you then fetch the next one)
+    rather than allowing retries: with attempts = hearts, retrying the same
+    twister would make the last heart unloseable and trivialise the game.
+14. **`GameSession` gained `current_twister_id` (R5.1's seven fields are
+    untouched):** grading needs to know which twister an attempt belongs to;
+    without it a resubmission could double-score. It is set by `/next`,
+    cleared by grading, and `0` means "no attempt pending" → 409.
+15. **`/next` is idempotent while an attempt is pending:** it re-serves the
+    same twister instead of selecting a new one. Selecting would let a player
+    skip hard twisters for free, and a page reload would lose the text.
 
 ---
 
@@ -255,7 +323,7 @@ Redis, no nickname in logs, 3/3 services healthy.
 - [x] **Step 1** — infra, schema, seed, request logging (R1, R2, R21.1–21.4/21.10)
 - [x] **Step 2** — game-session-creation (R3, R5, R20, R21.5) — *feature/game-session-creation*
 - [x] **Step 3** — tongue-twister selection + next-twister endpoint (R4, R6) — *feature/tongue-twister-selection*
-- [ ] **Step 4** — typing attempts, scoring, hearts (R7–R9)
+- [x] **Step 4** — typing attempts, scoring, hearts (R7–R9) — *feature/attempts-scoring-hearts*
 - [ ] **Step 5** — game end win/loss + leaderboard (R10–R12)
 - [ ] **Step 6** — admin JWT auth + CRUD endpoints (R13–R17)
 - [ ] **Step 7** — game UI + admin panel frontend (R18, R19)

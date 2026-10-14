@@ -179,6 +179,41 @@ func (s *Server) handleNextTwister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A finished game keeps its final state: once the last Heart is gone the
+	// player has lost (R9) and no further twister may be served. Recording
+	// the result is R10's job in Step 5.
+	if session.Hearts <= 0 {
+		writeError(w, http.StatusConflict, "the game has already ended")
+		return
+	}
+
+	// The tongue-twister already being typed is returned again rather than
+	// replaced: swapping it would let a player skip everything hard for
+	// free, and it makes a page reload (repeated /next) show the same text.
+	// Only when the pending twister has vanished from the catalogue does
+	// selection run and hand out a fresh one.
+	if session.CurrentTwisterID != 0 {
+		pending, err := s.content.TwisterByID(ctx, session.CurrentTwisterID)
+		switch {
+		case err == nil:
+			writeJSON(w, http.StatusOK, nextTwisterResponse{
+				TongueTwisterID: pending.ID,
+				Text:            pending.Text,
+				Difficulty:      pending.Difficulty,
+				Hearts:          session.Hearts,
+				Score:           session.Score,
+			})
+			return
+		case errors.Is(err, store.ErrTwisterNotFound):
+			// Deleted mid-game: fall through to selection for a fresh one.
+		default:
+			// err carries only dbFailure's sanitized text (R21.4).
+			s.log.Error("pending tongue-twister could not be loaded", "error", err.Error())
+			writeError(w, http.StatusInternalServerError, "the pending tongue-twister could not be loaded")
+			return
+		}
+	}
+
 	twister, err := s.content.NextTwister(ctx, session.Difficulty, session.ShownIDs)
 	switch {
 	case errors.Is(err, store.ErrAllShown):
@@ -272,4 +307,185 @@ func isValidDifficulty(difficulty string) bool {
 		}
 	}
 	return false
+}
+
+// ---------------------------------------------------------------------------
+// Typing attempts, scoring and hearts (Requirements 7-9)
+// ---------------------------------------------------------------------------
+
+// attemptRequest is the POST /api/games/{id}/attempts body: the text the
+// player typed for the tongue-twister the session is currently typing. The
+// field is a pointer so an absent/null value (R5.6 style) can be told apart
+// from an explicitly empty one.
+type attemptRequest struct {
+	Text *string `json:"text"`
+}
+
+// attemptResponse is the result of grading one attempt. Hearts are mandatory
+// (R9.5); Score and Game_over ride along so the HUD reacts to a finished game
+// without an extra read.
+type attemptResponse struct {
+	SessionID       string `json:"session_id"`
+	TongueTwisterID int64  `json:"tongue_twister_id"`
+	Correct         bool   `json:"correct"`
+	Hearts          int    `json:"hearts"`
+	Score           int    `json:"score"`
+	GameOver        bool   `json:"game_over"`
+}
+
+// scoreFor is the points awarded for one correct attempt at the given
+// difficulty (R8). Difficulty is the only signal the Game_Session carries, so
+// harder content is worth more; a speed bonus can be layered on later if the
+// requirements ask for one. An unknown difficulty (impossible - sessions are
+// validated at creation, R3.4) scores like easy.
+func scoreFor(difficulty string) int {
+	switch difficulty {
+	case "medium":
+		return 20
+	case "hard":
+		return 30
+	default:
+		return 10
+	}
+}
+
+// normalizeForComparison makes two texts comparable for grading: surrounding
+// whitespace is irrelevant, internal whitespace runs count as one separator,
+// and letter case does not matter. Everything else - every character, every
+// punctuation mark - must match exactly.
+func normalizeForComparison(text string) string {
+	return strings.ToLower(strings.Join(strings.Fields(text), " "))
+}
+
+// handleAttempt grades one typing attempt (R7), updates Score (R8) and Hearts
+// (R9) and reports the result:
+//
+//	POST /api/games/{id}/attempts  {"text": "..."}
+//	  -> 200 with correct, hearts, score and game_over
+//	  -> 422 when the text is missing, empty or whitespace-only
+//	  -> 400 for a malformed body
+//	  -> 404 for an unknown or expired Session_ID
+//	  -> 409 when the game is already over (hearts at 0), when no twister is
+//	     awaiting an attempt (call /next first), when that twister vanished
+//	     from the catalogue, or when a concurrent request graded it first
+//	  -> 503 when the Cache cannot be read or written
+func (s *Server) handleAttempt(w http.ResponseWriter, r *http.Request) {
+	var req attemptRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxBodyBytes)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if problem := validateAttemptRequest(&req); problem != "" {
+		writeError(w, http.StatusUnprocessableEntity, problem)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+
+	sessionID := r.PathValue("id")
+	session, err := s.sessions.Get(ctx, sessionID)
+	switch {
+	case errors.Is(err, cache.ErrSessionNotFound):
+		writeError(w, http.StatusNotFound, "session not found or has expired")
+		return
+	case errors.Is(err, cache.ErrUnavailable):
+		s.log.Warn("game session could not be read", "error", err.Error())
+		writeError(w, http.StatusServiceUnavailable, "the session state could not be retrieved")
+		return
+	case err != nil:
+		s.log.Error("game session could not be read", "error", err.Error())
+		writeError(w, http.StatusInternalServerError, "the game session could not be read")
+		return
+	}
+
+	// R9 defines the game as "keep 3 hearts alive": once the last Heart is
+	// gone the game is over and nothing further can be graded. Persisting the
+	// result (Game_Record, leaderboard) is R10's job in Step 5.
+	if session.Hearts <= 0 {
+		writeError(w, http.StatusConflict, "the game has already ended")
+		return
+	}
+	// Grading needs a pending twister: without one there is nothing to
+	// compare against, and accepting the attempt would corrupt Score/Hearts.
+	if session.CurrentTwisterID == 0 {
+		writeError(w, http.StatusConflict, "no tongue-twister is awaiting an attempt")
+		return
+	}
+
+	twister, err := s.content.TwisterByID(ctx, session.CurrentTwisterID)
+	switch {
+	case errors.Is(err, store.ErrTwisterNotFound):
+		// The twister was deactivated/deleted after being served; /next can
+		// move the session past it, so the client is told to do exactly that.
+		writeError(w, http.StatusConflict, "the tongue-twister awaiting the attempt is no longer available")
+		return
+	case err != nil:
+		// err carries only dbFailure's sanitized text (R21.4).
+		s.log.Error("tongue-twister for the pending attempt could not be loaded", "error", err.Error())
+		writeError(w, http.StatusInternalServerError, "the attempt could not be graded")
+		return
+	}
+
+	correct := normalizeForComparison(*req.Text) == normalizeForComparison(twister.Text)
+	points := 0
+	if correct {
+		points = scoreFor(session.Difficulty)
+	}
+
+	updated, err := s.sessions.RecordAttempt(ctx, sessionID, correct, points)
+	switch {
+	case errors.Is(err, cache.ErrNoPendingAttempt):
+		// A concurrent request graded the same twister between our read and
+		// our write - only one of them may count.
+		writeError(w, http.StatusConflict, "no tongue-twister is awaiting an attempt")
+	case errors.Is(err, cache.ErrSessionNotFound):
+		writeError(w, http.StatusNotFound, "session not found or has expired")
+	case errors.Is(err, cache.ErrUnavailable):
+		s.log.Warn("game session could not be updated", "error", err.Error())
+		writeError(w, http.StatusServiceUnavailable, "the session state could not be updated")
+	default:
+		if err != nil {
+			s.log.Error("game session could not be updated", "error", err.Error())
+			writeError(w, http.StatusInternalServerError, "the game session could not be updated")
+			return
+		}
+		// R21.5: Session_ID and the outcome only - never the Nickname, and
+		// never the player-typed text either.
+		s.log.Info("attempt graded",
+			"session_id", updated.SessionID,
+			"tongue_twister_id", twister.ID,
+			"correct", correct,
+			"hearts", updated.Hearts,
+			"score", updated.Score)
+
+		writeJSON(w, http.StatusOK, attemptResponse{
+			SessionID:       updated.SessionID,
+			TongueTwisterID: twister.ID,
+			Correct:         correct,
+			Hearts:          updated.Hearts,
+			Score:           updated.Score,
+			GameOver:        updated.Hearts == 0,
+		})
+	}
+}
+
+// validateAttemptRequest returns one client-safe message listing every problem
+// with the request, or "" when it is valid:
+//
+//   - an absent/null field -> "missing required field(s): text" (R5.6 style)
+//   - empty/whitespace     -> "text is required"
+//
+// No length limit is enforced: a body over 1 GiB never reaches here (the
+// reader is capped at maxBodyBytes), and text longer than any catalogue row
+// simply grades as incorrect - which is exactly the right answer for a typo
+// run wild.
+func validateAttemptRequest(req *attemptRequest) string {
+	if req.Text == nil {
+		return "missing required field(s): text"
+	}
+	if strings.TrimSpace(*req.Text) == "" {
+		return "text is required"
+	}
+	return ""
 }
