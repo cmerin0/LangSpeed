@@ -12,6 +12,7 @@ import (
 	"unicode/utf8"
 
 	"langspeed/internal/cache"
+	"langspeed/internal/store"
 )
 
 // requestTimeout bounds one Cache round-trip so a struggling Cache cannot
@@ -122,6 +123,107 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSON(w, http.StatusOK, toStateResponse(session))
 	}
+}
+
+// nextTwisterResponse is a successful next-twister payload. Hearts are
+// mandatory: the request modified Game_Session state (the already-shown list),
+// and R9.5 requires the current Heart count in every such response. Score
+// rides along so the HUD stays in sync without an extra read.
+type nextTwisterResponse struct {
+	TongueTwisterID int64  `json:"tongue_twister_id"`
+	Text            string `json:"text"`
+	Difficulty      string `json:"difficulty"`
+	Hearts          int    `json:"hearts"`
+	Score           int    `json:"score"`
+}
+
+// completedResponse is the R6.3 notification that the session has seen every
+// tongue-twister for its difficulty. The session teardown itself (Game_Record,
+// leaderboard) lands with R10 in the game-end feature; this endpoint only
+// reports the condition, within the same request - far inside R6.3's 3-second
+// budget.
+type completedResponse struct {
+	Completed bool   `json:"completed"`
+	Message   string `json:"message"`
+}
+
+// handleNextTwister implements tongue-twister selection:
+//
+//	GET /api/games/{id}/next
+//	  -> 200 with the next tongue-twister (R6.2), recorded as shown first
+//	     (R6.4) so a repeat can never be served (R6.1)
+//	  -> 200 {"completed": true, ...} when the pool is exhausted (R6.3)
+//	  -> 404 when the difficulty has no active content (R4.6)
+//	  -> 404 for an unknown or expired Session_ID (R5.3)
+//	  -> 503 when the Cache cannot be read (R6.5) or written (R6.6) - the
+//	     R6.6 response never carries a tongue-twister
+func (s *Server) handleNextTwister(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+
+	sessionID := r.PathValue("id")
+	session, err := s.sessions.Get(ctx, sessionID)
+	switch {
+	case errors.Is(err, cache.ErrSessionNotFound):
+		writeError(w, http.StatusNotFound, "session not found or has expired")
+		return
+	case errors.Is(err, cache.ErrUnavailable):
+		// R6.5: the already-shown list could not be read, so no selection can
+		// be trusted; state is preserved because the read changed nothing.
+		s.log.Warn("game session could not be read", "error", err.Error())
+		writeError(w, http.StatusServiceUnavailable, "the session state could not be retrieved")
+		return
+	case err != nil:
+		s.log.Error("game session could not be read", "error", err.Error())
+		writeError(w, http.StatusInternalServerError, "the game session could not be read")
+		return
+	}
+
+	twister, err := s.content.NextTwister(ctx, session.Difficulty, session.ShownIDs)
+	switch {
+	case errors.Is(err, store.ErrAllShown):
+		// R6.3: notify the player; ending the Game_Session belongs to R10.
+		writeJSON(w, http.StatusOK, completedResponse{
+			Completed: true,
+			Message:   "all tongue-twisters for the current difficulty have been completed",
+		})
+		return
+	case errors.Is(err, store.ErrNoContent):
+		// R4.6: nothing active exists for this difficulty.
+		writeError(w, http.StatusNotFound, "no content is available for the selected difficulty")
+		return
+	case err != nil:
+		// err carries only dbFailure's sanitized text (R21.4).
+		s.log.Error("next tongue-twister could not be selected", "error", err.Error())
+		writeError(w, http.StatusInternalServerError, "the next tongue-twister could not be selected")
+		return
+	}
+
+	// R6.4: record the ID before the twister leaves the Server, so the very
+	// next selection already excludes it.
+	if _, err := s.sessions.AddShownTwister(ctx, sessionID, twister.ID); err != nil {
+		switch {
+		case errors.Is(err, cache.ErrSessionNotFound):
+			writeError(w, http.StatusNotFound, "session not found or has expired")
+		case errors.Is(err, cache.ErrUnavailable):
+			// R6.6: state could not be updated - report it and withhold the
+			// tongue-twister entirely.
+			s.log.Warn("game session could not be updated", "error", err.Error())
+			writeError(w, http.StatusServiceUnavailable, "the session state could not be updated")
+		default:
+			s.log.Error("game session could not be updated", "error", err.Error())
+			writeError(w, http.StatusInternalServerError, "the game session could not be updated")
+		}
+		return
+	}
+
+	writeJSON(w, http.StatusOK, nextTwisterResponse{
+		TongueTwisterID: twister.ID,
+		Text:            twister.Text,
+		Difficulty:      twister.Difficulty,
+		Hearts:          session.Hearts,
+		Score:           session.Score,
+	})
 }
 
 // validateStartRequest returns one client-safe message listing every problem

@@ -93,7 +93,11 @@ func main() {
 	sessions := cache.New(cfg.RedisAddr)
 	defer func() { _ = sessions.Close() }()
 
-	api := httpserver.New(cfg, log, sessions)
+	// Tongue-twister selection (R4, R6) runs against the migration-seeded
+	// catalogue via the same pool migrations used.
+	content := store.NewContent(db)
+
+	api := httpserver.New(cfg, log, sessions, content)
 	httpSrv := &http.Server{
 		Addr:              ":" + cfg.ServerPort,
 		Handler:           api.Handler(),

@@ -7,9 +7,10 @@ tongue-twisters as fast and accurately as possible. Pick a difficulty, keep
 **Stack:** Go backend · PostgreSQL (permanent data) · Redis (live game state +
 leaderboard) · plain HTML/CSS/JS frontend — all orchestrated by Docker Compose.
 
-**Current progress:** Step 1 (walking skeleton) ✅ and Step 2
-(`game-session-creation`) ✅ — Requirements 1, 2, 3, 5, 20 and parts of 21 are
-implemented and verified. See the traceability tables below.
+**Current progress:** Step 1 (walking skeleton) ✅, Step 2
+(`game-session-creation`) ✅ and Step 3 (`tongue-twister-selection`) ✅ —
+Requirements 1, 2, 3, 5, 6, 20 and parts of 4 and 21 are implemented and
+verified. See the traceability tables below.
 
 ---
 
@@ -28,8 +29,9 @@ LangSpeed/
     └── internal/
         ├── config/             # env loading + validation (R1.3, R1.4)
         ├── logging/            # structured JSON logger (R21.10)
-        ├── store/              # TCP health checks, migrations, Seed_Script
-        │   └── migrations/     # 0001..0004 SQL, embedded into the binary
+        ├── store/              # TCP health checks, migrations, Seed_Script,
+        │   │                     tongue-twister selection (R4, R6)
+        │   └── migrations/     # 0001..0005 SQL, embedded into the binary
         ├── cache/              # Redis: Game_Session store + R20 serialization
         └── httpserver/         # router, Request_Log middleware, game API
 ```
@@ -57,6 +59,7 @@ Then open <http://localhost:3000> (placeholder frontend) or
 |---|---|---|---|
 | `POST` | `/api/games` | `{"nickname":"carlo","difficulty":"easy"}` | `201` `{session_id, nickname, difficulty, hearts, score}` · `400` malformed JSON · `422` invalid/missing field(s) · `503` cache unavailable |
 | `GET` | `/api/games/{id}` | — | `200` session state · `404` not found or expired · `503` cache unavailable |
+| `GET` | `/api/games/{id}/next` | — | `200` `{tongue_twister_id, text, difficulty, hearts, score}` · `200 {"completed":true,"message":…}` pool exhausted (R6.3) · `404` unknown session or no content for the difficulty · `503` session state could not be retrieved/updated |
 | `GET` | `/healthz` | — | `200` `{"status":"ok"}` |
 
 ```bash
@@ -68,6 +71,11 @@ curl -s -X POST localhost:3000/api/games \
 
 # read it back (also refreshes the 2h inactivity window)
 curl -s localhost:3000/api/games/<session_id>
+
+# fetch the next tongue-twister (recorded as shown before it is returned)
+curl -s localhost:3000/api/games/<session_id>/next
+# -> {"tongue_twister_id":12,"text":"…","difficulty":"hard","hearts":3,"score":0}
+# -> {"completed":true,"message":"all tongue-twisters for the current difficulty have been completed"}
 ```
 
 Nickname: 1–32 characters (trimmed). Difficulty: exactly `easy`, `medium` or
@@ -143,6 +151,30 @@ The server refuses to start when a required variable is missing and logs
 **Tests:** `cd server && go test ./...` (23 tests across `config`, `cache`,
 `httpserver`) · `go vet ./...`
 
+### Step 3 — `tongue-twister-selection`
+
+| Requirement | Where | Status |
+|---|---|---|
+| R4.4 selection limited to the session's difficulty | `Content.NextTwister` (`difficulty = $1`) | ✅ verified |
+| R4.5 inactive tongue-twisters never selected | `AND active` | ✅ verified |
+| R4.6 no active content → error for the difficulty | `ErrNoContent` → 404 | ✅ verified (content deactivated live) |
+| R6.1 already-shown IDs excluded | `NOT (id = ANY($2))` + `AddShownTwister` | ✅ verified (12/12 unique) |
+| R6.2 random from the remaining pool | `ORDER BY random() LIMIT 1` | ✅ |
+| R6.3 pool exhausted → notify player, end session within 3 s | `{"completed":true,…}` 200 — notification now, session teardown with R10 in Step 5 (decision 7) | ✅ verified |
+| R6.4 record shown ID **before** returning the twister | `handleNextTwister` marks shown first | ✅ verified (Redis `shown_ids`) |
+| R6.5 Cache read fails → error, state preserved | `503 the session state could not be retrieved` | ✅ verified (cache stopped) |
+| R6.6 Cache write fails → error, **no twister** in the response | `503 the session state could not be updated` | ✅ unit test |
+| R21.5 `/next` log lines without the nickname | request log carries path only | ✅ leak check CLEAN |
+| Playable catalogue on first start (prerequisite) | `0005_seed_tongue_twisters.sql`, guarded | ✅ verified (12 easy / 10 medium / 8 hard) |
+
+**Tests:** 37 tests across `config`, `cache`, `httpserver`, `store` ·
+`go vet ./...` · `go test ./... -race -count=1` green on Linux. The
+`store` tests run against a real throw-away PostgreSQL via
+[testcontainers-go](https://testcontainers.com/) and skip cleanly where
+Docker is unavailable. **E2E (compose):** full 12-twister pool drained with no
+repeats, completion notification, R4.6 and R6.5 responses, `shown_ids` in
+Redis, no nickname in logs, 3/3 services healthy.
+
 ---
 
 ## Decisions & open questions
@@ -161,6 +193,18 @@ The server refuses to start when a required variable is missing and logs
    the leaderboard.
 6. **R7.3 (future):** mentions a "remaining Attempts count" that no requirement
    defines (only the 3-heart limit) — clarify.
+7. **R6.3 split across Steps 3 and 5:** pool exhaustion returns the completion
+   notification immediately (well within 3 s), but *ending* the Game_Session
+   writes a Game_Record and updates the leaderboard (R10–R11). The teardown
+   lands with Step 5; exhaustion is detected statelessly, so no intermediate
+   session field is needed.
+8. **Content seeding via guarded migration (`0005`)**, not a script: keeps the
+   one-command startup (R1/R2 spirit) and never overwrites a catalogue an
+   admin populated later (R14). The whole batch is skipped once any row
+   exists.
+9. **`/next` responses carry `hearts` (and `score`)** because the request
+   modifies Game_Session state (the shown list) — R9.5 requires the current
+   Heart count in every such response.
 
 ---
 
@@ -168,7 +212,7 @@ The server refuses to start when a required variable is missing and logs
 
 - [x] **Step 1** — infra, schema, seed, request logging (R1, R2, R21.1–21.4/21.10)
 - [x] **Step 2** — game-session-creation (R3, R5, R20, R21.5) — *feature/game-session-creation*
-- [ ] **Step 3** — tongue-twister selection + next-twister endpoint (R4, R6)
+- [x] **Step 3** — tongue-twister selection + next-twister endpoint (R4, R6) — *feature/tongue-twister-selection*
 - [ ] **Step 4** — typing attempts, scoring, hearts (R7–R9)
 - [ ] **Step 5** — game end win/loss + leaderboard (R10–R12)
 - [ ] **Step 6** — admin JWT auth + CRUD endpoints (R13–R17)
