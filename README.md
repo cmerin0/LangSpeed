@@ -21,6 +21,7 @@ LangSpeed/
 ├── docker-compose.yml          # exactly 3 services: server, database, cache
 ├── .env.example                # all configuration (copy to .env)
 ├── .dockerignore / .gitignore
+├── .github/workflows/ci.yml    # PR gate: go vet + go test -race
 ├── web/                        # static frontend (placeholder page for now)
 └── server/                     # Go module
     ├── Dockerfile              # multi-stage build (context = repo root)
@@ -103,6 +104,47 @@ The server refuses to start when a required variable is missing and logs
 > `DATABASE_URL`. To run the server outside Docker, add `ports:` entries for
 > `database`/`cache` in `docker-compose.yml` and point `DATABASE_URL` /
 > `REDIS_ADDR` at `localhost` (see `.env.example`).
+
+---
+
+## Continuous integration (`.github/workflows/ci.yml`)
+
+Every pull request runs the same checks a reviewer would otherwise have to run
+locally, so a broken build or a failing test is caught **before** merge, not
+after.
+
+| Aspect | Value | Why |
+|---|---|---|
+| Trigger | `on: pull_request` | the gate lives on PRs; pushes to `master`/`develop` are already covered by the merged PRs themselves |
+| Permissions | `contents: read` | least privilege — the workflow only inspects the code, it never writes |
+| Concurrency | one run per PR, `cancel-in-progress: true` | pushing again supersedes the previous run; no queue backlog, no stale red ✗ |
+| Runner | `ubuntu-latest`, `timeout-minutes: 10` | bounded cost — a hung test fails instead of burning minutes |
+| Working dir | `server/` | the Go module lives one level down (`docker-compose.yml` stays at the root) |
+| Go version | `go-version-file: server/go.mod` | CI and local toolchains stay in lockstep automatically when the module's Go version changes |
+| Module cache | keyed on `server/go.sum` | dependencies are downloaded once per `go.sum` change, not on every run |
+
+**Steps, in order:**
+
+1. **Checkout** — `actions/checkout@v7`.
+2. **Set up Go** — `actions/setup-go@v7`, version read from `go.mod` (currently
+   1.27), with the build cache keyed on `go.sum`.
+3. **`go vet ./...`** — static analysis: the cheap, catchable mistakes (bad
+   `Printf` verbs, unreachable code, malformed struct tags) fail the run before
+   any test executes.
+4. **`go test ./... -race -count=1`** — the full suite with the race detector
+   and a forced re-run (`-count=1` disables the test cache, so CI can never
+   report a stale "cached ok").
+
+**Notes:**
+
+- The job's status check is named **`go test`** — make that the required check
+  in branch protection so nothing merges around it.
+- The `store` package's tests use
+  [testcontainers-go](https://testcontainers.com/) to spin up a throw-away
+  PostgreSQL; Docker is available on GitHub's runners, so they run there and
+  only skip on machines without Docker.
+- No Docker images are built or pushed by CI yet — `docker compose up --build`
+  is still a manual/local verification step (see Step 1's E2E notes).
 
 ---
 

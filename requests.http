@@ -1,0 +1,107 @@
+@baseUrl = http://localhost:3000
+@sessionId = {{createGame.response.body.$.session_id}}
+
+###############################################################################
+# LangSpeed HTTP API smoke tests
+#
+# This file is intended for VS Code's REST Client extension (or any client that
+# supports the .http format). Start the project with Docker Compose or the Go
+# server, then send requests in order.
+#
+# Success payloads for the implemented endpoints:
+#   GET /healthz -> { "status": "ok", "service": "langspeed-server" }
+#   POST /api/games -> 201 {
+#       "session_id": "...",
+#       "nickname": "carlos1996",
+#       "difficulty": "hard",
+#       "hearts": 3,
+#       "score": 0
+#   }
+#   GET /api/games/{id} -> 200 same session shape as above, with refreshed TTL
+#   GET /api/games/{id}/next -> 200 {
+#       "tongue_twister_id": 12,
+#       "text": "...",
+#       "difficulty": "hard",
+#       "hearts": 3,
+#       "score": 0
+#   }
+#
+# Error payloads:
+#   400 -> { "error": "invalid JSON body" }
+#   404 -> { "error": "session not found or has expired" }
+#   422 -> { "error": "nickname is required" | ... }
+#   503 -> { "error": "the service is temporarily unavailable" }
+###############################################################################
+
+### 1) Health check
+# Expected: 200 with {"status":"ok","service":"langspeed-server"}
+GET {{baseUrl}}/healthz
+
+### 2) Create a new game session
+# @name createGame
+# Expected: 201 Created and a session_id in the response body.
+POST {{baseUrl}}/api/games
+Content-Type: application/json
+
+{
+  "nickname": "carlos1996",
+  "difficulty": "hard"
+}
+
+### 3) Read the current session state
+# Expected: 200 and the same session data, with session_id matching the created game.
+GET {{baseUrl}}/api/games/{{sessionId}}
+
+### 4) Fetch the next tongue-twister for the session
+# Expected: 200 with a tongue_twister_id, text, difficulty, hearts, and score.
+# The selected twister is recorded as shown before returning it.
+GET {{baseUrl}}/api/games/{{sessionId}}/next
+
+### 5) Fetch the next tongue-twister again
+# Expected: 200 with a different tongue_twister_id if there are still active
+# content entries for this difficulty. If the pool is exhausted, the endpoint
+# returns 200 {"completed":true,"message":"..."}.
+GET {{baseUrl}}/api/games/{{sessionId}}/next
+
+### 6) Error case: malformed JSON
+# Expected: 400 and {"error":"invalid JSON body"}
+POST {{baseUrl}}/api/games
+Content-Type: application/json
+
+{
+  "nickname": "carlos1996",
+  "difficulty":
+}
+
+### 7) Error case: missing nickname
+# Expected: 422 and {"error":"missing required field(s): nickname"}
+POST {{baseUrl}}/api/games
+Content-Type: application/json
+
+{
+  "difficulty": "easy"
+}
+
+### 8) Error case: invalid difficulty
+# Expected: 422 and an error listing the accepted values: easy, medium, hard
+POST {{baseUrl}}/api/games
+Content-Type: application/json
+
+{
+  "nickname": "carlos1996",
+  "difficulty": "insane"
+}
+
+### 9) Error case: nickname too long
+# Expected: 422 and a message naming the 32-character limit.
+POST {{baseUrl}}/api/games
+Content-Type: application/json
+
+{
+  "nickname": "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz",
+  "difficulty": "easy"
+}
+
+### 10) Error case: unknown or expired session
+# Expected: 404 and {"error":"session not found or has expired"}
+GET {{baseUrl}}/api/games/00000000-0000-0000-0000-000000000000
