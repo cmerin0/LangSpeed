@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -30,7 +31,9 @@ type testServer struct {
 
 // newTestServer builds a Server backed by an in-process Redis. The default
 // fake selector echoes the requested difficulty; /next tests override
-// ts.server.content when they need a different outcome.
+// ts.server.content when they need a different outcome. The fake recorder
+// captures what game end tried to persist (R10-R11) so those tests need no
+// database either; tests read it via ts.server.results.(*fakeRecorder).
 func newTestServer(t *testing.T) *testServer {
 	t.Helper()
 	mr := miniredis.RunT(t)
@@ -40,6 +43,7 @@ func newTestServer(t *testing.T) *testServer {
 		logging.New(logs),
 		cache.New(mr.Addr()),
 		&fakeContent{},
+		&fakeRecorder{},
 	)
 	return &testServer{server: server, logs: logs, mr: mr}
 }
@@ -59,6 +63,7 @@ func newDeadCacheServer(t *testing.T) *testServer {
 		logging.New(logs),
 		dead,
 		&fakeContent{},
+		&fakeRecorder{},
 	)
 	return &testServer{server: server, logs: logs}
 }
@@ -122,6 +127,20 @@ func (f *fakeContent) TwisterByID(_ context.Context, id int64) (*store.Twister, 
 		Text:       "She sells seashells by the seashore.",
 		Difficulty: "easy",
 	}, nil
+}
+
+// fakeRecorder substitutes for the PostgreSQL-backed game-record writer
+// (R10-R11): it keeps every GameResult the game-end path tried to persist,
+// so tests can assert the record's fields and count how often it was written
+// (exactly once per finished game). err simulates a failing database.
+type fakeRecorder struct {
+	results []store.GameResult
+	err     error
+}
+
+func (f *fakeRecorder) SaveGameResult(_ context.Context, result store.GameResult) error {
+	f.results = append(f.results, result)
+	return f.err
 }
 
 // request performs a request against the full handler stack (including the
@@ -667,7 +686,8 @@ func TestAttemptThreeWrongEndsGame(t *testing.T) {
 		t.Errorf("error = %q, want the game-over message", msg)
 	}
 
-	// /next refuses too - the lost game's state is final (until R10 lands).
+	// /next refuses too - the lost game's state is final (and its result was
+	// persisted by the game-end path of R10-R12).
 	rec = ts.request("GET", "/api/games/"+sessionID+"/next", "")
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("next after game over = %d, want 409 (%s)", rec.Code, rec.Body.String())
@@ -947,5 +967,352 @@ func TestAttemptLogOmitsNicknameAndTypedText(t *testing.T) {
 	}
 	if strings.Contains(logs, "seashells") {
 		t.Errorf("player-typed text leaked into the logs:\n%s", logs)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Game end: Game_Record, attempt details, leaderboard (Requirements 10-12)
+// ---------------------------------------------------------------------------
+
+// loseGame plays a session until the last Heart is gone: every round fetches
+// the pending twister (/next is idempotent, so it serves fresh only when
+// nothing is pending - the fake repeats ID 42) and submits a wrong attempt.
+// It returns the final, game-ending attempt response.
+func loseGame(t *testing.T, ts *testServer, sessionID string) attemptResponse {
+	t.Helper()
+	var final attemptResponse
+	for attempt := 1; attempt <= cache.InitialHearts; attempt++ {
+		rec := ts.request("GET", "/api/games/"+sessionID+"/next", "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("next %d status = %d, want 200 (%s)", attempt, rec.Code, rec.Body.String())
+		}
+		rec = ts.request("POST", "/api/games/"+sessionID+"/attempts", `{"text":"complete nonsense"}`)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("attempt %d status = %d, want 200 (%s)", attempt, rec.Code, rec.Body.String())
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &final); err != nil {
+			t.Fatalf("attempt %d response is not JSON: %v", attempt, err)
+		}
+		if want := cache.InitialHearts - attempt; final.Hearts != want {
+			t.Fatalf("attempt %d Hearts = %d, want %d", attempt, final.Hearts, want)
+		}
+		if wantGameOver := attempt == cache.InitialHearts; final.GameOver != wantGameOver {
+			t.Fatalf("attempt %d game_over = %t, want %t", attempt, final.GameOver, wantGameOver)
+		}
+	}
+	return final
+}
+
+// TestAttemptLossPersistsFinishedGame covers the loss half of decision 10
+// with R10-R12: the attempt that takes the last Heart writes exactly one
+// Game_Record (final score, difficulty, start/end times), one attempt_details
+// row per graded twister (R11), folds the score into the difficulty's
+// leaderboard (R12) and stamps the session - while the player simply sees
+// game_over, and no nickname reaches any log line (R21.5).
+func TestAttemptLossPersistsFinishedGame(t *testing.T) {
+	ts := newTestServer(t)
+	recorder := ts.server.results.(*fakeRecorder)
+	sessionID, served := startAndServe(t, ts, "hard")
+	ctx := context.Background()
+
+	// A fresh game is not over yet.
+	fresh := ts.request("GET", "/api/games/"+sessionID, "")
+	var freshState gameStateResponse
+	if err := json.Unmarshal(fresh.Body.Bytes(), &freshState); err != nil {
+		t.Fatalf("get response is not JSON: %v", err)
+	}
+	if freshState.GameOver {
+		t.Error("game_over = true before the game ended")
+	}
+
+	// One correct attempt (+30), then the three wrong ones that empty the
+	// Hearts - the last of them is the loss.
+	correct := ts.request("POST", "/api/games/"+sessionID+"/attempts", `{"text":"`+served.Text+`"}`)
+	if correct.Code != http.StatusOK {
+		t.Fatalf("correct attempt status = %d, want 200 (%s)", correct.Code, correct.Body.String())
+	}
+	final := loseGame(t, ts, sessionID)
+	if final.Hearts != 0 || !final.GameOver {
+		t.Fatalf("final attempt = %+v, want 0 Hearts and game_over", final)
+	}
+
+	// Exactly one Game_Record, carrying the session's final state.
+	if len(recorder.results) != 1 {
+		t.Fatalf("persisted %d game results, want exactly 1", len(recorder.results))
+	}
+	result := recorder.results[0]
+	if result.Nickname != "canary-player" {
+		t.Errorf("Nickname = %q, want canary-player", result.Nickname)
+	}
+	if result.Difficulty != "hard" {
+		t.Errorf("Difficulty = %q, want hard", result.Difficulty)
+	}
+	if result.FinalScore != scoreFor("hard") {
+		t.Errorf("FinalScore = %d, want %d (one correct hard attempt)", result.FinalScore, scoreFor("hard"))
+	}
+	if result.StartedAt.IsZero() || result.EndedAt.IsZero() || result.EndedAt.Before(result.StartedAt) {
+		t.Errorf("timestamps = %v..%v, want a sane start/end pair", result.StartedAt, result.EndedAt)
+	}
+
+	// One attempt_details row per graded attempt (R11): the correct one
+	// first, then the three wrong ones that emptied the Hearts - all with a
+	// non-negative measured time.
+	if len(result.Attempts) != cache.InitialHearts+1 {
+		t.Fatalf("attempt details = %+v, want %d rows (1 correct + 3 wrong)", result.Attempts, cache.InitialHearts+1)
+	}
+	wantOutcomes := []bool{true, false, false, false}
+	for i, wantCorrect := range wantOutcomes {
+		attempt := result.Attempts[i]
+		if attempt.Success != wantCorrect {
+			t.Errorf("Attempts[%d].Success = %t, want %t", i, attempt.Success, wantCorrect)
+		}
+		if attempt.TimeTakenMS < 0 {
+			t.Errorf("Attempts[%d].TimeTakenMS = %d, want >= 0 (R11)", i, attempt.TimeTakenMS)
+		}
+	}
+
+	// The session is stamped as ended, and GET reports it so a reloading
+	// client stops playing.
+	stored, err := ts.server.sessions.Get(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("stored session could not be read: %v", err)
+	}
+	if stored.EndedAt.IsZero() {
+		t.Error("session was not stamped as ended")
+	}
+	rec := ts.request("GET", "/api/games/"+sessionID, "")
+	var ended gameStateResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &ended); err != nil {
+		t.Fatalf("get response is not JSON: %v", err)
+	}
+	if !ended.GameOver {
+		t.Error("game_over = false after the game ended")
+	}
+
+	// The score reached the hard leaderboard (R12).
+	entries, err := ts.server.sessions.TopLeaderboard(ctx, "hard", 10)
+	if err != nil {
+		t.Fatalf("leaderboard could not be read: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Nickname != "canary-player" || entries[0].Score != scoreFor("hard") {
+		t.Errorf("hard board = %+v, want canary-player at %d", entries, scoreFor("hard"))
+	}
+
+	if strings.Contains(ts.logs.String(), "canary-player") {
+		t.Errorf("nickname leaked into the logs:\n%s", ts.logs.String())
+	}
+}
+
+// TestAttemptAfterLossPersistsOnlyOnce: the Step 4 guards (409 "the game has
+// already ended" on attempts and /next) keep a finished game from being
+// played on - and from being persisted a second time (R10).
+func TestAttemptAfterLossPersistsOnlyOnce(t *testing.T) {
+	ts := newTestServer(t)
+	recorder := ts.server.results.(*fakeRecorder)
+	sessionID, _ := startAndServe(t, ts, "medium")
+	loseGame(t, ts, sessionID)
+
+	rec := ts.request("POST", "/api/games/"+sessionID+"/attempts", `{"text":"anything"}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("attempt after game over = %d, want 409 (%s)", rec.Code, rec.Body.String())
+	}
+	if msg := errorBody(t, rec); !strings.Contains(msg, "the game has already ended") {
+		t.Errorf("error = %q, want the game-over message", msg)
+	}
+	rec = ts.request("GET", "/api/games/"+sessionID+"/next", "")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("next after game over = %d, want 409 (%s)", rec.Code, rec.Body.String())
+	}
+
+	if len(recorder.results) != 1 {
+		t.Errorf("persisted %d game results, want exactly 1 (the refused requests add none)", len(recorder.results))
+	}
+}
+
+// TestNextCompletingPoolWinsAndPersists covers the win half of decision 10
+// with R10-R12 and decision 7's now-landed teardown: when /next finds the
+// pool exhausted with Hearts left, the same request writes the Game_Record
+// and the leaderboard entry, the response reports the final result, and a
+// second /next is a 409 - never a second record.
+func TestNextCompletingPoolWinsAndPersists(t *testing.T) {
+	ts := newTestServer(t)
+	recorder := ts.server.results.(*fakeRecorder)
+	sessionID, served := startAndServe(t, ts, "easy")
+	ctx := context.Background()
+
+	// Grade the served twister correctly, then empty the pool.
+	rec := ts.request("POST", "/api/games/"+sessionID+"/attempts", `{"text":"`+served.Text+`"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("attempt status = %d, want 200 (%s)", rec.Code, rec.Body.String())
+	}
+	ts.server.content = &fakeContent{err: store.ErrAllShown}
+
+	rec = ts.request("GET", "/api/games/"+sessionID+"/next", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("next status = %d, want 200 (%s)", rec.Code, rec.Body.String())
+	}
+	var payload completedResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("response is not JSON: %v", err)
+	}
+	if !payload.Completed || !payload.GameOver {
+		t.Errorf("payload = %+v, want completed and game_over", payload)
+	}
+	if payload.Hearts != cache.InitialHearts {
+		t.Errorf("Hearts = %d, want %d (a win keeps every Heart)", payload.Hearts, cache.InitialHearts)
+	}
+	if payload.Score != scoreFor("easy") {
+		t.Errorf("Score = %d, want %d", payload.Score, scoreFor("easy"))
+	}
+
+	// The result is persisted exactly once: one record, final state intact.
+	if len(recorder.results) != 1 {
+		t.Fatalf("persisted %d game results, want exactly 1", len(recorder.results))
+	}
+	result := recorder.results[0]
+	if result.Nickname != "canary-player" || result.Difficulty != "easy" || result.FinalScore != scoreFor("easy") {
+		t.Errorf("record = %+v, want canary-player/easy/%d", result, scoreFor("easy"))
+	}
+	if len(result.Attempts) != 1 || !result.Attempts[0].Success || result.Attempts[0].TimeTakenMS < 0 {
+		t.Errorf("attempt details = %+v, want the single correct attempt", result.Attempts)
+	}
+
+	// A second /next is refused - and persists nothing more.
+	rec = ts.request("GET", "/api/games/"+sessionID+"/next", "")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("second next = %d, want 409 (%s)", rec.Code, rec.Body.String())
+	}
+	if msg := errorBody(t, rec); !strings.Contains(msg, "the game has already ended") {
+		t.Errorf("error = %q, want the game-over message", msg)
+	}
+	rec = ts.request("POST", "/api/games/"+sessionID+"/attempts", `{"text":"anything"}`)
+	if rec.Code != http.StatusConflict || !strings.Contains(errorBody(t, rec), "the game has already ended") {
+		t.Errorf("attempt after the win = %d %s, want 409 game-over", rec.Code, rec.Body.String())
+	}
+	if len(recorder.results) != 1 {
+		t.Errorf("persisted %d game results after the refused requests, want exactly 1", len(recorder.results))
+	}
+
+	// The win reached the easy leaderboard.
+	entries, err := ts.server.sessions.TopLeaderboard(ctx, "easy", 10)
+	if err != nil {
+		t.Fatalf("leaderboard could not be read: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Nickname != "canary-player" || entries[0].Score != scoreFor("easy") {
+		t.Errorf("easy board = %+v, want canary-player at %d", entries, scoreFor("easy"))
+	}
+	if strings.Contains(ts.logs.String(), "canary-player") {
+		t.Errorf("nickname leaked into the logs:\n%s", ts.logs.String())
+	}
+}
+
+// TestGameEndPersistenceIsBestEffort: when the Game_Record cannot be
+// written, the game is still over for the player (200 + game_over, the
+// guards stay closed) and the operator gets an ERROR line - carrying the
+// session ID and sanitized cause, never the nickname (R21.4, R21.5).
+func TestGameEndPersistenceIsBestEffort(t *testing.T) {
+	ts := newTestServer(t)
+	ts.server.results = &fakeRecorder{
+		err: errors.New(`game record could not be saved: relation "game_records" does not exist (SQLSTATE 42P01)`),
+	}
+	sessionID, _ := startAndServe(t, ts, "hard")
+
+	final := loseGame(t, ts, sessionID)
+	if final.Hearts != 0 || !final.GameOver {
+		t.Fatalf("final attempt = %+v, want the game over regardless of persistence", final)
+	}
+
+	logs := ts.logs.String()
+	if !strings.Contains(logs, `"msg":"game result could not be persisted"`) {
+		t.Errorf("missing the persistence-failure log line:\n%s", logs)
+	}
+	if !strings.Contains(logs, `"msg":"game ended"`) {
+		t.Errorf("missing the game-ended log line:\n%s", logs)
+	}
+	if strings.Contains(logs, "canary-player") {
+		t.Errorf("nickname leaked into the logs:\n%s", logs)
+	}
+
+	// The 409 guards stay closed either way - play cannot resume.
+	rec := ts.request("POST", "/api/games/"+sessionID+"/attempts", `{"text":"anything"}`)
+	if rec.Code != http.StatusConflict {
+		t.Errorf("attempt after the unpersisted game over = %d, want 409", rec.Code)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Leaderboard endpoint (Requirement 12)
+// ---------------------------------------------------------------------------
+
+// TestLeaderboardEndpoint: three boards come back ordered by score with
+// 1-based ranks, capped at the top 10 - empty boards as [] rather than null -
+// and seeded nicknames never reach the request log (R21.5).
+func TestLeaderboardEndpoint(t *testing.T) {
+	ts := newTestServer(t)
+	ctx := context.Background()
+
+	rec := ts.request("GET", "/api/leaderboard", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("leaderboard status = %d, want 200 (%s)", rec.Code, rec.Body.String())
+	}
+	var empty leaderboardResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &empty); err != nil {
+		t.Fatalf("response is not JSON: %v", err)
+	}
+	if empty.Easy == nil || empty.Medium == nil || empty.Hard == nil {
+		t.Errorf("empty boards = %+v, want three non-nil [] lists", empty)
+	}
+
+	// Twelve scores on easy (only the top 10 are served), one on medium.
+	for i := 1; i <= 12; i++ {
+		nickname := fmt.Sprintf("player-%02d", i)
+		if err := ts.server.sessions.SaveLeaderboardScore(ctx, "easy", nickname, i*10); err != nil {
+			t.Fatalf("SaveLeaderboardScore(%s) failed: %v", nickname, err)
+		}
+	}
+	if err := ts.server.sessions.SaveLeaderboardScore(ctx, "medium", "mid-only", 777); err != nil {
+		t.Fatalf("SaveLeaderboardScore(medium) failed: %v", err)
+	}
+
+	rec = ts.request("GET", "/api/leaderboard", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("leaderboard status = %d, want 200 (%s)", rec.Code, rec.Body.String())
+	}
+	var board leaderboardResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &board); err != nil {
+		t.Fatalf("response is not JSON: %v", err)
+	}
+	if len(board.Easy) != 10 {
+		t.Fatalf("easy board = %d entries, want the limit 10", len(board.Easy))
+	}
+	if want := (leaderboardEntryResponse{Rank: 1, Nickname: "player-12", Score: 120}); board.Easy[0] != want {
+		t.Errorf("easy[0] = %+v, want %+v", board.Easy[0], want)
+	}
+	if want := (leaderboardEntryResponse{Rank: 10, Nickname: "player-03", Score: 30}); board.Easy[9] != want {
+		t.Errorf("easy[9] = %+v, want %+v", board.Easy[9], want)
+	}
+	if want := (leaderboardEntryResponse{Rank: 1, Nickname: "mid-only", Score: 777}); len(board.Medium) != 1 || board.Medium[0] != want {
+		t.Errorf("medium board = %+v, want [%+v]", board.Medium, want)
+	}
+	if board.Hard == nil || len(board.Hard) != 0 {
+		t.Errorf("hard board = %+v, want an empty non-nil list", board.Hard)
+	}
+
+	// The request log records the path only - no seeded nickname appears.
+	if strings.Contains(ts.logs.String(), "player-") || strings.Contains(ts.logs.String(), "mid-only") {
+		t.Errorf("leaderboard nicknames leaked into the logs:\n%s", ts.logs.String())
+	}
+}
+
+// TestLeaderboardCacheUnavailable: an unreachable Cache answers 503 with the
+// client-safe summary (R3.6 style).
+func TestLeaderboardCacheUnavailable(t *testing.T) {
+	ts := newDeadCacheServer(t)
+	rec := ts.request("GET", "/api/leaderboard", "")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("leaderboard status = %d, want 503 (%s)", rec.Code, rec.Body.String())
+	}
+	if msg := errorBody(t, rec); !strings.Contains(msg, "the leaderboard could not be retrieved") {
+		t.Errorf("error = %q, want the leaderboard-unavailable message", msg)
 	}
 }

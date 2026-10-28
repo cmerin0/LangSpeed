@@ -27,6 +27,7 @@ type Server struct {
 	log      *logging.Logger
 	sessions *cache.Store
 	content  twisterContent
+	results  gameRecorder
 	mux      *http.ServeMux
 }
 
@@ -40,9 +41,17 @@ type twisterContent interface {
 	TwisterByID(ctx context.Context, id int64) (*store.Twister, error)
 }
 
+// gameRecorder persists a finished game: R10's Game_Record with R11's
+// Attempt_Details, written together in one transaction by *store.Records.
+// Tests substitute a fake that records what the handlers tried to persist,
+// so game-end behaviour is verifiable without a database.
+type gameRecorder interface {
+	SaveGameResult(ctx context.Context, result store.GameResult) error
+}
+
 // New builds the server and registers every route known at this stage.
-func New(cfg config.Config, log *logging.Logger, sessions *cache.Store, content twisterContent) *Server {
-	s := &Server{cfg: cfg, log: log, sessions: sessions, content: content, mux: http.NewServeMux()}
+func New(cfg config.Config, log *logging.Logger, sessions *cache.Store, content twisterContent, results gameRecorder) *Server {
+	s := &Server{cfg: cfg, log: log, sessions: sessions, content: content, results: results, mux: http.NewServeMux()}
 	s.routes()
 	s.registerStatic()
 	return s
@@ -66,6 +75,10 @@ func (s *Server) routes() {
 	// Typing attempts, scoring and hearts (R7-R9). POST because an attempt
 	// changes Game_Session state.
 	s.mux.HandleFunc("POST /api/games/{id}/attempts", s.handleAttempt)
+
+	// Leaderboard (R12): a read-only ranking that never touches a session,
+	// so it lives outside the /api/games tree.
+	s.mux.HandleFunc("GET /api/leaderboard", s.handleLeaderboard)
 }
 
 // handleHealthz answers liveness probes with a structured JSON body.

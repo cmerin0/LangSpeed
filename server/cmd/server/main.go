@@ -97,7 +97,11 @@ func main() {
 	// catalogue via the same pool migrations used.
 	content := store.NewContent(db)
 
-	api := httpserver.New(cfg, log, sessions, content)
+	// Finished games (R10, R11) are persisted at game end through the same
+	// pool; the leaderboard they feed lives in Redis (R12, cache.Store).
+	results := store.NewRecords(db)
+
+	api := httpserver.New(cfg, log, sessions, content, results)
 	httpSrv := &http.Server{
 		Addr:              ":" + cfg.ServerPort,
 		Handler:           api.Handler(),
