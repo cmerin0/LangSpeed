@@ -37,13 +37,16 @@ type startGameRequest struct {
 
 // gameStateResponse is the Game_Session state returned to clients (R5.5).
 // Only R5.5's Session_ID is mandated; the remaining fields give the frontend
-// everything R18 needs to render the HUD right away.
+// everything R18 needs to render the HUD right away. Game_over (Step 5)
+// tells a reloading client that the game is finished even when Hearts remain
+// - the win half of decision 10 - so no further attempt is attempted.
 type gameStateResponse struct {
 	SessionID  string `json:"session_id"`
 	Nickname   string `json:"nickname"`
 	Difficulty string `json:"difficulty"`
 	Hearts     int    `json:"hearts"`
 	Score      int    `json:"score"`
+	GameOver   bool   `json:"game_over"`
 }
 
 func toStateResponse(session *cache.GameSession) gameStateResponse {
@@ -53,6 +56,10 @@ func toStateResponse(session *cache.GameSession) gameStateResponse {
 		Difficulty: session.Difficulty,
 		Hearts:     session.Hearts,
 		Score:      session.Score,
+		// EndedAt marks both outcomes; the Hearts check also covers a lost
+		// session whose end stamp could not be written (best-effort, see
+		// endGame) - it is over either way.
+		GameOver: !session.EndedAt.IsZero() || session.Hearts <= 0,
 	}
 }
 
@@ -138,13 +145,17 @@ type nextTwisterResponse struct {
 }
 
 // completedResponse is the R6.3 notification that the session has seen every
-// tongue-twister for its difficulty. The session teardown itself (Game_Record,
-// leaderboard) lands with R10 in the game-end feature; this endpoint only
-// reports the condition, within the same request - far inside R6.3's 3-second
-// budget.
+// tongue-twister for its difficulty - and, with Hearts left, the moment the
+// player has won (decision 10): the same request writes the Game_Record,
+// its attempt details and the leaderboard entry (R10-R12, decision 7's
+// teardown), well inside R6.3's 3-second budget. Game_over, Hearts and Score
+// ride along so the frontend can finish the game without a second request.
 type completedResponse struct {
 	Completed bool   `json:"completed"`
 	Message   string `json:"message"`
+	GameOver  bool   `json:"game_over"`
+	Hearts    int    `json:"hearts"`
+	Score     int    `json:"score"`
 }
 
 // handleNextTwister implements tongue-twister selection:
@@ -152,9 +163,12 @@ type completedResponse struct {
 //	GET /api/games/{id}/next
 //	  -> 200 with the next tongue-twister (R6.2), recorded as shown first
 //	     (R6.4) so a repeat can never be served (R6.1)
-//	  -> 200 {"completed": true, ...} when the pool is exhausted (R6.3)
+//	  -> 200 {"completed": true, ...} when the pool is exhausted (R6.3) -
+//	     the win half of decision 10: this request also persists the
+//	     finished game (R10-R12), so a later call answers 409 instead
 //	  -> 404 when the difficulty has no active content (R4.6)
 //	  -> 404 for an unknown or expired Session_ID (R5.3)
+//	  -> 409 when the game has already ended (lost, or completed already)
 //	  -> 503 when the Cache cannot be read (R6.5) or written (R6.6) - the
 //	     R6.6 response never carries a tongue-twister
 func (s *Server) handleNextTwister(w http.ResponseWriter, r *http.Request) {
@@ -179,10 +193,11 @@ func (s *Server) handleNextTwister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// A finished game keeps its final state: once the last Heart is gone the
-	// player has lost (R9) and no further twister may be served. Recording
-	// the result is R10's job in Step 5.
-	if session.Hearts <= 0 {
+	// A finished game keeps its final state: a lost game has no Hearts left
+	// (R9.6) and a finished game carries its end stamp (R10) - either way no
+	// further twister may be served, and the result was already persisted
+	// when the game ended (game-end handling of Step 5).
+	if session.Hearts <= 0 || !session.EndedAt.IsZero() {
 		writeError(w, http.StatusConflict, "the game has already ended")
 		return
 	}
@@ -217,10 +232,20 @@ func (s *Server) handleNextTwister(w http.ResponseWriter, r *http.Request) {
 	twister, err := s.content.NextTwister(ctx, session.Difficulty, session.ShownIDs)
 	switch {
 	case errors.Is(err, store.ErrAllShown):
-		// R6.3: notify the player; ending the Game_Session belongs to R10.
+		// R6.3's notification, and - with Hearts left - the win of decision
+		// 10: this request performs decision 7's deferred teardown, writing
+		// the Game_Record, its attempt details and the leaderboard entry
+		// (R10-R12) before answering. A repeat call is stopped by the
+		// end-stamp guard above; a request racing across the finish line is
+		// stopped inside endGame by MarkEnded, so the record is written
+		// exactly once.
+		s.endGame(ctx, sessionID)
 		writeJSON(w, http.StatusOK, completedResponse{
 			Completed: true,
 			Message:   "all tongue-twisters for the current difficulty have been completed",
+			GameOver:  true,
+			Hearts:    session.Hearts,
+			Score:     session.Score,
 		})
 		return
 	case errors.Is(err, store.ErrNoContent):
@@ -235,8 +260,9 @@ func (s *Server) handleNextTwister(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// R6.4: record the ID before the twister leaves the Server, so the very
-	// next selection already excludes it.
-	if _, err := s.sessions.AddShownTwister(ctx, sessionID, twister.ID); err != nil {
+	// next selection already excludes it. The serve time starts R11's clock
+	// for the attempt this response asks for.
+	if _, err := s.sessions.AddShownTwister(ctx, sessionID, twister.ID, time.Now().UTC()); err != nil {
 		switch {
 		case errors.Is(err, cache.ErrSessionNotFound):
 			writeError(w, http.StatusNotFound, "session not found or has expired")
@@ -361,13 +387,17 @@ func normalizeForComparison(text string) string {
 // (R9) and reports the result:
 //
 //	POST /api/games/{id}/attempts  {"text": "..."}
-//	  -> 200 with correct, hearts, score and game_over
+//	  -> 200 with correct, hearts, score and game_over; when this attempt
+//	     takes the last Heart, the same request persists the finished game -
+//	     Game_Record, attempt details, leaderboard (R10-R12) - so the result
+//	     exists before the client is told the game is over
 //	  -> 422 when the text is missing, empty or whitespace-only
 //	  -> 400 for a malformed body
 //	  -> 404 for an unknown or expired Session_ID
-//	  -> 409 when the game is already over (hearts at 0), when no twister is
-//	     awaiting an attempt (call /next first), when that twister vanished
-//	     from the catalogue, or when a concurrent request graded it first
+//	  -> 409 when the game has already ended (0 Hearts or completed already),
+//	     when no twister is awaiting an attempt (call /next first), when that
+//	     twister vanished from the catalogue, or when a concurrent request
+//	     graded it first
 //	  -> 503 when the Cache cannot be read or written
 func (s *Server) handleAttempt(w http.ResponseWriter, r *http.Request) {
 	var req attemptRequest
@@ -400,9 +430,10 @@ func (s *Server) handleAttempt(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// R9 defines the game as "keep 3 hearts alive": once the last Heart is
-	// gone the game is over and nothing further can be graded. Persisting the
-	// result (Game_Record, leaderboard) is R10's job in Step 5.
-	if session.Hearts <= 0 {
+	// gone the game is over (R9.6) and nothing further can be graded. A
+	// finished game - lost or completed - carries its end stamp (R10) and is
+	// equally final; its result was persisted when it ended.
+	if session.Hearts <= 0 || !session.EndedAt.IsZero() {
 		writeError(w, http.StatusConflict, "the game has already ended")
 		return
 	}
@@ -433,7 +464,7 @@ func (s *Server) handleAttempt(w http.ResponseWriter, r *http.Request) {
 		points = scoreFor(session.Difficulty)
 	}
 
-	updated, err := s.sessions.RecordAttempt(ctx, sessionID, correct, points)
+	updated, err := s.sessions.RecordAttempt(ctx, sessionID, correct, points, time.Now().UTC())
 	switch {
 	case errors.Is(err, cache.ErrNoPendingAttempt):
 		// A concurrent request graded the same twister between our read and
@@ -458,6 +489,14 @@ func (s *Server) handleAttempt(w http.ResponseWriter, r *http.Request) {
 			"correct", correct,
 			"hearts", updated.Hearts,
 			"score", updated.Score)
+
+		// The last Heart is gone: this attempt is the loss of decision 10.
+		// Persist the finished game (R10-R12) before the response reports
+		// game_over, so the result can never be stranded behind the "the
+		// game has already ended" 409 that follows.
+		if updated.Hearts == 0 {
+			s.endGame(ctx, sessionID)
+		}
 
 		writeJSON(w, http.StatusOK, attemptResponse{
 			SessionID:       updated.SessionID,
@@ -488,4 +527,71 @@ func validateAttemptRequest(req *attemptRequest) string {
 		return "text is required"
 	}
 	return ""
+}
+
+// ---------------------------------------------------------------------------
+// Game end: Game_Record, attempt details, leaderboard (Requirements 10-12)
+// ---------------------------------------------------------------------------
+
+// endGame persists a finished game exactly once (R10-R12), in three steps:
+//
+//  1. the Game_Session is stamped with EndedAt in the Cache - the flag every
+//     game-end guard checks (409 "the game has already ended"). The stamp is
+//     write-once: a concurrent duplicate (an attempt and a /next racing over
+//     the finish line) gets cache.ErrAlreadyEnded and stands down, so at most
+//     one Game_Record per game is ever inserted;
+//  2. the Game_Record (R10) and its Attempt_Details (R11) are inserted into
+//     PostgreSQL in one transaction, built from the attempts the session
+//     collected while the game ran;
+//  3. the final Score is folded into the difficulty's Redis leaderboard
+//     (R12), keeping only the nickname's highest score.
+//
+// The session's end state is authoritative for the API no matter what
+// happens below: guards refuse play from step 1 on, so steps 2 and 3 are
+// best effort. Their failures are logged for the operator - session ID and
+// sanitized cause only, never the nickname (R21.5 / R21.4) - while the
+// player still receives the game-over they earned. On the win path a failed
+// step 1 even heals itself: the session stays un-ended, so the next /next
+// finds the exhausted pool again and retries.
+func (s *Server) endGame(ctx context.Context, sessionID string) {
+	ended, err := s.sessions.MarkEnded(ctx, sessionID, time.Now().UTC())
+	if errors.Is(err, cache.ErrAlreadyEnded) {
+		return // another request is already persisting this game
+	}
+	if err != nil {
+		// err is the cache sentinel text only (R21.4); the Nickname stays
+		// out of the line (R21.5).
+		s.log.Error("game session could not be marked ended", "session_id", sessionID, "error", err.Error())
+		return
+	}
+
+	// R21.5: Session_ID, Difficulty and the outcome - never the Nickname.
+	s.log.Info("game ended",
+		"session_id", ended.SessionID,
+		"difficulty", ended.Difficulty,
+		"score", ended.Score,
+		"hearts", ended.Hearts)
+
+	result := store.GameResult{
+		Nickname:   ended.Nickname,
+		FinalScore: ended.Score,
+		Difficulty: ended.Difficulty,
+		StartedAt:  ended.CreatedAt,
+		EndedAt:    ended.EndedAt,
+		Attempts:   make([]store.AttemptResult, 0, len(ended.Attempts)),
+	}
+	for _, attempt := range ended.Attempts {
+		result.Attempts = append(result.Attempts, store.AttemptResult{
+			TwisterID:   attempt.TwisterID,
+			TimeTakenMS: attempt.TimeTakenMS,
+			Success:     attempt.Correct,
+		})
+	}
+	if err := s.results.SaveGameResult(ctx, result); err != nil {
+		// err carries only dbFailure's sanitized text (R21.4).
+		s.log.Error("game result could not be persisted", "session_id", ended.SessionID, "error", err.Error())
+	}
+	if err := s.sessions.SaveLeaderboardScore(ctx, ended.Difficulty, ended.Nickname, ended.Score); err != nil {
+		s.log.Error("leaderboard could not be updated", "session_id", ended.SessionID, "error", err.Error())
+	}
 }

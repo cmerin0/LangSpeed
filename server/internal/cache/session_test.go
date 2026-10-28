@@ -15,8 +15,9 @@ func fixedTime() time.Time {
 }
 
 // sampleSession returns a fully populated session, including a non-empty
-// already-shown list to exercise nested collections and a pending twister to
-// exercise the attempt state (R7).
+// already-shown list to exercise nested collections, a pending twister with
+// its serve timestamp to exercise the R11 timing state, a populated attempt
+// history and an end stamp to exercise the R10 game-end state.
 func sampleSession() *GameSession {
 	return &GameSession{
 		SessionID:        "550e8400-e29b-41d4-a716-446655440000",
@@ -27,6 +28,13 @@ func sampleSession() *GameSession {
 		ShownIDs:         []int64{7, 3, 42},
 		CreatedAt:        fixedTime(),
 		CurrentTwisterID: 42,
+		ServedAt:         fixedTime().Add(90 * time.Second),
+		Attempts: []AttemptRecord{
+			{TwisterID: 7, TimeTakenMS: 4213, Correct: true},
+			{TwisterID: 3, TimeTakenMS: 987, Correct: false},
+			{TwisterID: 42, TimeTakenMS: 60000, Correct: true},
+		},
+		EndedAt: fixedTime().Add(10 * time.Minute),
 	}
 }
 
@@ -66,6 +74,21 @@ func assertSessionsEqual(t *testing.T, want, got *GameSession) {
 	if got.CurrentTwisterID != want.CurrentTwisterID {
 		t.Errorf("CurrentTwisterID = %d, want %d", got.CurrentTwisterID, want.CurrentTwisterID)
 	}
+	if !got.ServedAt.Equal(want.ServedAt) {
+		t.Errorf("ServedAt = %v, want %v", got.ServedAt, want.ServedAt)
+	}
+	if !got.EndedAt.Equal(want.EndedAt) {
+		t.Errorf("EndedAt = %v, want %v", got.EndedAt, want.EndedAt)
+	}
+	if len(got.Attempts) != len(want.Attempts) {
+		t.Errorf("Attempts = %+v, want %+v", got.Attempts, want.Attempts)
+	} else {
+		for i := range want.Attempts {
+			if got.Attempts[i] != want.Attempts[i] {
+				t.Errorf("Attempts[%d] = %+v, want %+v", i, got.Attempts[i], want.Attempts[i])
+			}
+		}
+	}
 }
 
 // TestNewGameSessionInitializesFields covers R5.1: every mandated field is
@@ -99,6 +122,15 @@ func TestNewGameSessionInitializesFields(t *testing.T) {
 	}
 	if session.CurrentTwisterID != 0 {
 		t.Errorf("CurrentTwisterID = %d, want 0 - no twister is pending before /next serves one (R7)", session.CurrentTwisterID)
+	}
+	if !session.ServedAt.IsZero() {
+		t.Errorf("ServedAt = %v, want zero - no twister has been served yet (R11)", session.ServedAt)
+	}
+	if session.Attempts == nil || len(session.Attempts) != 0 {
+		t.Errorf("Attempts = %v, want an empty non-nil list", session.Attempts)
+	}
+	if !session.EndedAt.IsZero() {
+		t.Errorf("EndedAt = %v, want zero - a new game is running (R10)", session.EndedAt)
 	}
 	if !session.CreatedAt.Equal(fixedTime()) {
 		t.Errorf("CreatedAt = %v, want %v", session.CreatedAt, fixedTime())
